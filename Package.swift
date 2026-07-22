@@ -28,5 +28,7 @@ let package = Package(
             name: "MageFlowGate", dependencies: ["MageFlow"], path: "Sources/MageFlowGate"),
         .executableTarget(
             name: "MageVAEGate", dependencies: ["MageFlow"], path: "Sources/MageVAEGate"),
+        .executableTarget(
+            name: "GSGate", dependencies: ["MageFlow"], path: "Sources/GSGate"),
     ]
 )
