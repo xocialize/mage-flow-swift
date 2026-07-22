@@ -30,5 +30,7 @@ let package = Package(
             name: "MageVAEGate", dependencies: ["MageFlow"], path: "Sources/MageVAEGate"),
         .executableTarget(
             name: "GSGate", dependencies: ["MageFlow"], path: "Sources/GSGate"),
+        .executableTarget(
+            name: "E2EGate", dependencies: ["MageFlow"], path: "Sources/E2EGate"),
     ]
 )

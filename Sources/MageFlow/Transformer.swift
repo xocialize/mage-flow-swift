@@ -128,18 +128,29 @@ public func applyRotary(_ x: MLXArray, cos cosT: MLXArray, sin sinT: MLXArray) -
 
 // MARK: - Timestep
 
+/// Vendored `get_timestep_embedding` (NOT diffusers'):
 /// Timesteps(256, flip_sin_to_cos=true, downscale_freq_shift=0, scale=1000).
 ///
-/// The exponent table is deliberately downcast to the input dtype BEFORE the
-/// multiply — upstream notes the model was trained with that exact bf16 rounding
-/// and that diffusers' fp32 variant degrades output. Do not "fix" this.
-public func timestepEmbedding(_ t: MLXArray, dim: Int = 256, dtype: DType) -> MLXArray {
+/// ⚠ The frequency table is downcast to `roundDtype` (bf16) BEFORE the multiply.
+/// This is the whole reason upstream vendors its own copy — the model was trained
+/// with that exact bf16 rounding, and diffusers' fp32 variant degrades output.
+/// It is LOAD-BEARING and per-sigma sensitive: at scale-1000 arguments the bf16
+/// rounding of the table flips cos/sin at some sigmas (step 2 of the Turbo
+/// schedule most of all) and barely moves them at others — which reads as a
+/// mysterious non-uniform per-step error if you round to fp32 instead.
+///
+/// Op order matches upstream exactly: `sigma * freqs`, THEN `* scale`, THEN the
+/// sinusoid — not `(sigma*scale) * freqs`.
+public func timestepEmbedding(_ t: MLXArray, dim: Int = 256, roundDtype: DType = .bfloat16)
+    -> MLXArray
+{
     let half = dim / 2
     let exponent = -log(10_000.0) * MLXArray((0 ..< half).map { Float($0) }) / Float(half)
-    let freqs = exp(exponent).asType(dtype).asType(.float32)
-    let args = (t.asType(.float32) * 1000.0)[0..., .newAxis] * freqs[.newAxis, 0...]
+    let freqs = exp(exponent).asType(roundDtype).asType(.float32)   // bf16-round the table
+    var emb = t.asType(.float32)[0..., .newAxis] * freqs[.newAxis, 0...]
+    emb = 1000.0 * emb
     // flip_sin_to_cos -> [cos, sin]
-    return concatenated([cos(args), sin(args)], axis: -1)
+    return concatenated([cos(emb), sin(emb)], axis: -1)
 }
 
 public final class TimestepEmbedding: Module {
@@ -163,8 +174,21 @@ public final class MageFlowTimestepEmbeddings: Module {
         super.init()
     }
     /// `sigma` is the raw sigma in [0,1] — NOT t in [0,1000].
+    ///
+    /// ⚠ The sigma is rounded to the DiT compute `dtype` BEFORE the embedding —
+    /// upstream `mage_flow.py:112` does `timesteps = timesteps.to(img.dtype)`
+    /// and get_timestep_embedding then scales by 1000. This is LOAD-BEARING, not
+    /// a precision detail: at scale-1000 arguments a bf16 rounding of sigma
+    /// (e.g. 0.947368 -> 0.949219) shifts cos/sin by whole radians, changing the
+    /// embedding entirely. At sigma == 1.0 the round is exact, which is why step 0
+    /// alone looks correct if you skip this. In production dtype is bf16 so the
+    /// round happens naturally; an fp32 parity run must round to bf16 explicitly.
     public func callAsFunction(sigma: MLXArray, dtype: DType) -> MLXArray {
-        timestepEmbedder(timestepEmbedding(sigma, dtype: dtype).asType(dtype))
+        // Both the sigma AND the frequency table are bf16-rounded — upstream runs
+        // the whole timestep path in the img dtype (bf16 in production). See
+        // timestepEmbedding and mage_flow.py:112.
+        let roundedSigma = sigma.asType(.bfloat16).asType(sigma.dtype)
+        return timestepEmbedder(timestepEmbedding(roundedSigma).asType(dtype))
     }
 }
 
@@ -425,5 +449,12 @@ public final class MageFlowTransformer: Module {
             out[key] = v
         }
         return out
+    }
+}
+
+extension MageFlowTransformer {
+    /// Debug: expose the timestep embedding for a given sigma.
+    public func tembFor(sigma: Float) -> MLXArray {
+        timeTextEmbed(sigma: MLXArray([sigma]), dtype: .float32)
     }
 }
