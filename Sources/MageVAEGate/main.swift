@@ -72,4 +72,22 @@ for r in rows.items {
 err(String(repeating: "-", count: 64))
 let pass = worst < 1e-4
 err(String(format: "worst relative = %.3e  ->  %@", worst, (pass ? "PASS" : "FAIL") as NSString))
+
+// --- scheduler: exact-value gate against the oracle's captured schedule ------
+// Turbo (4 steps, shift 6.0) has a closed-form expected schedule; check it to
+// the digit rather than trusting the implementation.
+let sched = FlowMatchEulerScheduler(steps: 4, shift: 6.0)
+let expectSigmas: [Float] = [1.0, 0.947368, 0.857143, 0.666667, 0.0]
+let expectTs: [Float] = [1000.0, 947.37, 857.14, 666.67]
+var schedOK = sched.sigmas.count == expectSigmas.count && sched.timesteps.count == expectTs.count
+if schedOK {
+    for (a, b) in zip(sched.sigmas, expectSigmas) where abs(a - b) > 1e-5 { schedOK = false }
+    for (a, b) in zip(sched.timesteps, expectTs) where abs(a - b) > 1e-2 { schedOK = false }
+}
+err("")
+err("[sched] sigmas    \(sched.sigmas.map { (($0 * 1e6).rounded() / 1e6) })")
+err("[sched] timesteps \(sched.timesteps.map { (($0 * 100).rounded() / 100) })")
+err("[sched] 4-step Turbo schedule -> \(schedOK ? "PASS" : "FAIL")")
+if !schedOK { exit(1) }
+
 exit(pass ? 0 : 1)
