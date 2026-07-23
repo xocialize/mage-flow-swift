@@ -349,7 +349,14 @@ public final class MageFlowEditPipeline {
         // Mirrors upstream screen_edit: real CONTENT_FILTER_EDIT_SYSTEM, the
         // exact user message, greedy generate, JSON verdict. The filter uses REAL
         // spatial M-RoPE (no flat override) — only the conditioning path is flat.
+        // ⚠ The filter sees the ORIGINAL-resolution image (upstream pipeline.py
+        // screens BEFORE the 384px _resize_long_edge, which is conditioning-only).
+        // Reusing the 384px conditioning grid here changed the vision-token grid
+        // enough to flip borderline verdicts (found live: a benign anime-style
+        // edit refused with a self-contradictory rambling reason; upstream torch
+        // passes the same input cleanly).
         if screen {
+            let (filterPixels, filterGrid) = imageProcessor.preprocess(rgb: rgb, width: iw, height: ih)
             let instr = instruction.trimmingCharacters(in: .whitespacesAndNewlines)
             let userText = "There is 1 source image(s) above. Edit instruction: "
                 + (instr.isEmpty ? "(no textual instruction)" : instr)
@@ -358,10 +365,10 @@ public final class MageFlowEditPipeline {
                 "<|im_start|>system\n\(contentFilterEditSystem)<|im_end|>\n"
                 + "<|im_start|>user\n\(visionPlaceholder)\(userText)<|im_end|>\n"
                 + "<|im_start|>assistant\n"
-            let fids = try buildInputIds(formatted: filterPrompt, grid: grid)
+            let fids = try buildInputIds(formatted: filterPrompt, grid: filterGrid)
             let verdictTokens = try conditioner().generate(
                 inputIds: MLXArray(fids, [1, fids.count]),
-                pixelValues: pixelValues, imageGridTHW: [grid], maxTokens: 192)
+                pixelValues: filterPixels, imageGridTHW: [filterGrid], maxTokens: 192)
             let verdict = tokenizer.decode(tokens: verdictTokens.map { Int($0) })
                 .replacingOccurrences(of: " ", with: "")
             if verdict.lowercased().contains("\"violates\":true") {
