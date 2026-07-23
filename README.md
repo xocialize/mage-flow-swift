@@ -21,14 +21,29 @@ live at **[xocialize/Mage-Flow-Edit-Turbo-mlx](https://huggingface.co/xocialize/
 (`Weights/folded_adaln.safetensors` here is the same file); regenerate with
 `Weights/dump_folded_adaln.py`.
 
-## Scope
+## Scope — full family supported
 
-`Mage-Flow-Edit-Turbo` (4-step, cfg 1.0) is validated end-to-end. The other five
-family checkpoints share every parity-locked component (VAE, DiT architecture,
-Qwen3-VL, scheduler) but are **not yet runnable** here: the Base/RL edit
-checkpoints need the CFG / `batch_cfg` denoise path (cfg > 1), and the three
-T2I checkpoints need the text-to-image path (no reference image, `start_idx=34`
-template). Both are the next steps.
+All six checkpoints run and are validated (numeric per-step gates vs the
+PyTorch oracle + a clean render each at real defaults):
+
+| checkpoint | mode | defaults | validation |
+|---|---|---|---|
+| Mage-Flow-Edit-Turbo | edit | 4 / cfg 1.0 | full parity suite + e2e |
+| Mage-Flow-Edit (RL) | edit | 20 / cfg 5.0 | per-step CFG gate 1.3e-2 + render |
+| Mage-Flow-Edit-Base | edit | 30 / cfg 5.0 | render |
+| Mage-Flow (RL) | t2i | 20 / cfg 5.0 | t2i gate 5.5e-2, CFG per-step 2.5e-2 + render |
+| Mage-Flow-Base | t2i | 30 / cfg 5.0 | render |
+| Mage-Flow-Turbo | t2i | 4 / cfg 1.0 | render |
+
+CFG is implemented as two forwards (upstream `batch_cfg=False`) — mathematically
+identical to the fused varlen pack, since rotary attention depends only on
+relative positions. Upstream's default negative prompt is a single space `" "`.
+
+**Gate note:** at cfg 5.0 an accumulated-trajectory latent comparison is the
+wrong metric — guidance multiplies each step's ~1e-2 cross-dtype noise into the
+next step's input, and trajectories diverge chaotically while remaining equally
+valid. Gate the per-step map (oracle input → one step) plus decoded-image
+validity instead.
 
 ## Components (all parity-locked vs the PyTorch oracle, CPU stream)
 

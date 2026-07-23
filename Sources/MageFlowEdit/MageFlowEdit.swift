@@ -33,6 +33,10 @@ public struct MageFlowEditConfig {
     public var gsKey: UInt64 = 20_260_720
     public var seed: UInt64 = 42
     public var startIdx = 64            // "mage-flow-edit" template: drop 64 tokens
+    public var t2iStartIdx = 34         // "mage-flow" template: drop 34 tokens
+    public var cfg: Float = 1.0         // Base 5.0 / RL 5.0 / Turbo 1.0
+    public var negPrompt = " "          // upstream default: a single SPACE (truthy)
+    public var renormalization = false
     public init() {}
 }
 
@@ -44,6 +48,14 @@ public let mageFlowEditTemplate =
     + "input where appropriate.<|im_end|>\n<|im_start|>user\n{}<|im_end|>\n<|im_start|>assistant\n"
 
 let visionPlaceholder = "<|vision_start|><|image_pad|><|vision_end|>"
+
+/// "mage-flow" T2I template (verbatim from models/utils.py), start_idx = 34.
+/// NOTE: no space/newline between "background:" and <|im_end|> — the 34-token
+/// slice is tied to this exact text.
+public let mageFlowT2ITemplate =
+    "<|im_start|>system\nDescribe the image by detailing the color, shape, size, texture, quantity, "
+    + "text, spatial relationships of the objects and background:"
+    + "<|im_end|>\n<|im_start|>user\n{}<|im_end|>\n<|im_start|>assistant\n"
 
 public enum MageFlowEditError: Error, CustomStringConvertible {
     case refused(String)
@@ -176,6 +188,63 @@ public final class MageFlowEditPipeline {
         return out
     }
 
+    // MARK: text-only conditioning (T2I)
+
+    /// Encode a T2I prompt: template, tokenize, text-only forward, drop 34 tokens.
+    func encodeT2I(_ prompt: String) throws -> MLXArray {
+        let formatted = mageFlowT2ITemplate.replacingOccurrences(of: "{}", with: prompt)
+        let ids = tokenizer.encode(text: formatted).map { Int32($0) }
+        var feats = try vl.lastHiddenState(inputIds: MLXArray(ids, [1, ids.count]))
+        feats = feats[0..., cfg.t2iStartIdx..., 0...].asType(.float32)
+        eval(feats)
+        return feats
+    }
+
+    /// T2I content filter — upstream screen_text: CONTENT_FILTER_SYSTEM, greedy
+    /// generate (<=160 new tokens), fail-closed.
+    func screenT2I(_ prompt: String) throws {
+        guard !prompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
+        let fp = "<|im_start|>system\n\(contentFilterT2ISystem)<|im_end|>\n"
+            + "<|im_start|>user\nPrompt to classify:\n\(prompt)<|im_end|>\n<|im_start|>assistant\n"
+        let fids = tokenizer.encode(text: fp).map { Int32($0) }
+        let toks = try vl.generate(inputIds: MLXArray(fids, [1, fids.count]), maxTokens: 160)
+        let verdict = tokenizer.decode(tokens: toks.map { Int($0) })
+            .replacingOccurrences(of: " ", with: "")
+        if verdict.lowercased().contains("\"violates\":true") {
+            throw MageFlowEditError.refused(verdict)
+        }
+    }
+
+    /// Text-to-image (Mage-Flow / -Base / -Turbo). Returns NHWC [1,H,W,3] in [-1,1].
+    public func t2i(prompt: String, screen: Bool = true) throws -> MLXArray {
+        if screen { try screenT2I(prompt) }
+        let side = (cfg.size / 16) * 16
+        let (lh, lw) = (side / 16, side / 16)
+
+        let feats = try encodeT2I(prompt)
+        let useCFG = cfg.cfg > 1.0 && !cfg.negPrompt.isEmpty
+        let negFeats = useCFG ? try encodeT2I(cfg.negPrompt) : nil
+
+        let noise = gaussianShadingNoise(
+            channels: 128, height: lh, width: lw, key: cfg.gsKey, seed: cfg.seed)
+        let img0 = MLXArray(noise, [1, 128, lh, lw]).transposed(0, 2, 3, 1)
+            .reshaped(1, lh * lw, 128).asType(ditDtype)
+
+        let sched = FlowMatchEulerScheduler(steps: cfg.steps, shift: cfg.shift)
+        let pipe = MageFlowPipeline(transformer: transformer)
+        // whole sequence is the target; single shape entry, frame idx 0
+        let out = pipe.denoise(
+            img: img0, txt: feats.asType(ditDtype), targetLen: lh * lw,
+            imgShapes: [(frame: 1, height: lh, width: lw)], scheduler: sched,
+            negTxt: negFeats.map { $0.asType(ditDtype) }, cfg: cfg.cfg,
+            renormalization: cfg.renormalization)
+        let latent = out.reshaped(1, lh, lw, 128).asType(.float32)
+        eval(latent)
+        let img = vaeDecode(latent, vae)
+        eval(img)
+        return img
+    }
+
     // MARK: the pipeline
 
     /// Returns the edited RGB as NHWC [1,H,W,3] in [-1,1]. `screen` runs the
@@ -226,17 +295,25 @@ public final class MageFlowEditPipeline {
         }
 
         // --- conditioning features ----------------------------------------
-        let body = "Image 1: \(visionPlaceholder)\(instruction)"
-        let formatted = mageFlowEditTemplate.replacingOccurrences(of: "{}", with: body)
-        let ids = buildInputIds(formatted: formatted, grid: grid)
-        let inputIds = MLXArray(ids, [1, ids.count])
         // Mage-Flow feeds FLAT positions — M-RoPE degenerates to 1-D.
-        let flat = Qwen3VL.flatPositionIds(sequenceLength: ids.count)
-        var feats = try vl.lastHiddenState(
-            inputIds: inputIds, pixelValues: pixelValues, imageGridTHW: [grid], positionIds: flat)
-        // slice off the first start_idx tokens (system preamble)
-        feats = feats[0..., cfg.startIdx..., 0...].asType(.float32)
-        eval(feats)
+        func encodeEdit(_ instr: String) throws -> MLXArray {
+            let body = "Image 1: \(visionPlaceholder)\(instr)"
+            let formatted = mageFlowEditTemplate.replacingOccurrences(of: "{}", with: body)
+            let ids = buildInputIds(formatted: formatted, grid: grid)
+            let flat = Qwen3VL.flatPositionIds(sequenceLength: ids.count)
+            var f = try vl.lastHiddenState(
+                inputIds: MLXArray(ids, [1, ids.count]), pixelValues: pixelValues,
+                imageGridTHW: [grid], positionIds: flat)
+            // slice off the first start_idx tokens (system preamble)
+            f = f[0..., cfg.startIdx..., 0...].asType(.float32)
+            eval(f)
+            return f
+        }
+        let feats = try encodeEdit(instruction)
+        // CFG (Base/RL): negative pass encodes the SAME ref image with the
+        // negative instruction (upstream: edit_refs + edit_refs, pos + neg).
+        let useCFG = cfg.cfg > 1.0 && !cfg.negPrompt.isEmpty
+        let negFeats = useCFG ? try encodeEdit(cfg.negPrompt) : nil
 
         // --- ref latent (full target resolution) --------------------------
         let refPx = Self.resize(rgb, iw, ih, side, side)
@@ -259,7 +336,9 @@ public final class MageFlowEditPipeline {
         let sched = FlowMatchEulerScheduler(steps: cfg.steps, shift: cfg.shift)
         let pipe = MageFlowPipeline(transformer: transformer)
         let out = pipe.denoise(img: packed, txt: feats.asType(ditDtype),
-                               targetLen: lh * lw, imgShapes: shapes, scheduler: sched)
+                               targetLen: lh * lw, imgShapes: shapes, scheduler: sched,
+                               negTxt: negFeats.map { $0.asType(ditDtype) }, cfg: cfg.cfg,
+                               renormalization: cfg.renormalization)
         let targetLatent = out[0..., ..<(lh * lw), 0...].reshaped(1, lh, lw, 128).asType(.float32)
         eval(targetLatent)
 
