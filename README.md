@@ -54,6 +54,7 @@ validity instead.
 | Gaussian-Shading watermark | 0 (bit-exact) | `GSGate` |
 | FlowMatchEuler schedule | exact | Turbo 4-step to the digit |
 | end-to-end 4-step denoise | 2.8e-2 | `E2EGate` (bf16-oracle vs fp32) |
+| **full resolution range 512–2048** | 2048² @ **34.2 dB PSNR** vs oracle | decoded-render gate, every tier eyeballed |
 
 Qwen3-VL-4B conditioning + the content filter come from
 [qwen3vl-mlx-swift](https://github.com/xocialize/qwen3vl-mlx-swift).

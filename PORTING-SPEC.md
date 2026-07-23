@@ -870,3 +870,15 @@ thresholds (`MageFlowGate --nax-probe`, cos > 0.999 AND max_abs < 100).
 Shipped code keeps the row-chunk (correct on stock AND fixed kernels). After any
 mlx-swift version bump: run `--nax-probe`; on PASS, delete `downProjected` here
 and `MLP.downProjected` in qwen3vl-mlx-swift.
+
+
+## Resolution range CLOSED: 512–2048 validated (2026-07-23)
+
+The deferred 2048² oracle capture ran (382 min CPU, `capture.py --stage C --sizes 2048`).
+Result vs the Swift port at identical settings (seed 42, 4-step Turbo edit, bf16 +
+row-chunk, 32 768 packed tokens): **mean_abs 2.57/255, PSNR 34.2 dB** — near-identical
+images. The slightly painterly fur texture at 2048² appears in BOTH renders → it is the
+model's native 4×-base behaviour, not a port artifact. Range summary: 512² pixel-identical
+(earlier gate), 768²/1024²/1536² oracle renders coherent, 2048² at 34.2 dB. The full
+512–2048 claim on the cards is now evidence-backed. Remaining Mage-Flow item: delete the
+row-chunk when an mlx-swift release vendors mlx ≥ #3810 (probe first).
