@@ -9,6 +9,7 @@
 // a folded_adaln.safetensors (from the port's dump_folded_adaln.py) at its root.
 
 import Foundation
+import MLX
 import MageFlowEdit
 
 func fail(_ s: String) -> Never { FileHandle.standardError.write(Data((s + "\n").utf8)); exit(2) }
@@ -58,6 +59,8 @@ do {
     MageFlowEditPipeline.savePNG(img, to: URL(fileURLWithPath: out))
     FileHandle.standardError.write(
         Data("edited in \(String(format: "%.1f", Date().timeIntervalSince(t1)))s -> \(out)\n".utf8))
+    FileHandle.standardError.write(
+        Data(String(format: "peak GPU memory %.2f GB\n", Double(GPU.peakMemory) / 1e9).utf8))
 } catch let e as MageFlowEditError {
     if case .refused(let v) = e {
         FileHandle.standardError.write(Data("REFUSED by content filter: \(v)\n".utf8))
