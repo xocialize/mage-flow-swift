@@ -1,5 +1,5 @@
 {
-  "originHash" : "84a04b40eada673200542611c26747635c1a440aade11d3d8a749524e0486282",
+  "originHash" : "8881afe0031ab363e9ab56d68dd20045b057c9da2a7fc3d2ee3ef763f045bf90",
   "pins" : [
     {
       "identity" : "eventsource",
@@ -8,6 +8,24 @@
       "state" : {
         "revision" : "a3a85a85214caf642abaa96ae664e4c772a59f6e",
         "version" : "1.4.1"
+      }
+    },
+    {
+      "identity" : "mlx-engine-swift",
+      "kind" : "remoteSourceControl",
+      "location" : "https://github.com/xocialize/mlx-engine-swift",
+      "state" : {
+        "revision" : "7e1a2f02a0b4107d483f32955c43b2c767de8f76",
+        "version" : "0.31.0"
+      }
+    },
+    {
+      "identity" : "mlx-profiling",
+      "kind" : "remoteSourceControl",
+      "location" : "https://github.com/xocialize/mlx-profiling.git",
+      "state" : {
+        "revision" : "a1cee71340e28253b1796c655ac861756c87452d",
+        "version" : "0.1.0"
       }
     },
     {

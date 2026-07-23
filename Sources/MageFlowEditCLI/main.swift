@@ -18,6 +18,7 @@ var repo: String?, ref: String?, prompt: String?, out = "edit.png"
 var cfg = MageFlowEditConfig()
 var filter = true
 var t2iMode = false
+var ditQuant: String?
 
 var it = CommandLine.arguments.dropFirst().makeIterator()
 while let arg = it.next() {
@@ -34,6 +35,7 @@ while let arg = it.next() {
     case "--cfg": cfg.cfg = Float(it.next() ?? "") ?? cfg.cfg
     case "--neg": cfg.negPrompt = it.next() ?? cfg.negPrompt
     case "--renorm": cfg.renormalization = true
+    case "--dit-quant": ditQuant = it.next()
     default: fail("unknown arg \(arg)")
     }
 }
@@ -48,6 +50,7 @@ let pipe = try await MageFlowEditPipeline(
     transformerDir: root.appendingPathComponent("transformer"),
     vaeSafetensors: root.appendingPathComponent("vae/diffusion_pytorch_model.safetensors"),
     foldedAdaLN: root.appendingPathComponent("folded_adaln.safetensors"),
+    ditQuant: ditQuant.map { URL(fileURLWithPath: $0) },
     cfg: cfg)
 FileHandle.standardError.write(Data("loaded in \(String(format: "%.1f", Date().timeIntervalSince(t0)))s\n".utf8))
 

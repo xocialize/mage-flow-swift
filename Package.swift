@@ -14,12 +14,16 @@ let package = Package(
     products: [
         .library(name: "MageFlow", targets: ["MageFlow"]),
         .library(name: "MageFlowEdit", targets: ["MageFlowEdit"]),
+        .library(name: "MLXMageFlow", targets: ["MLXMageFlow"]),
     ],
     dependencies: [
         .package(url: "https://github.com/ml-explore/mlx-swift.git", from: "0.31.4"),
         .package(url: "https://github.com/xocialize/qwen3vl-mlx-swift.git", branch: "main"),
         .package(url: "https://github.com/huggingface/swift-transformers", from: "1.3.3"),
         .package(url: "https://github.com/ml-explore/mlx-swift-lm.git", from: "3.31.3"),
+        // ≥0.27.0 for the CAN cancellation gate (MLXServeConformance.CancellationConformance).
+        .package(url: "https://github.com/xocialize/mlx-engine-swift", from: "0.27.0"),
+        .package(url: "https://github.com/xocialize/mlx-profiling.git", from: "0.1.0"),
     ],
     targets: [
         .target(
@@ -53,5 +57,25 @@ let package = Package(
             path: "Sources/MageFlowEdit"),
         .executableTarget(
             name: "mage-flow-edit", dependencies: ["MageFlowEdit"], path: "Sources/MageFlowEditCLI"),
+        .target(
+            name: "MLXMageFlow",
+            dependencies: [
+                "MageFlow", "MageFlowEdit",
+                .product(name: "MLX", package: "mlx-swift"),
+                .product(name: "MLXToolKit", package: "mlx-engine-swift"),
+                .product(name: "MLXProfiling", package: "mlx-profiling"),
+            ],
+            path: "Sources/MLXMageFlow"),
+        .executableTarget(
+            name: "mage-pkg-smoke",
+            dependencies: ["MLXMageFlow"],
+            path: "Sources/MagePkgSmoke"),
+        .testTarget(
+            name: "MLXMageFlowTests",
+            dependencies: [
+                "MLXMageFlow",
+                .product(name: "MLXServeConformance", package: "mlx-engine-swift"),
+            ],
+            path: "Tests/MLXMageFlowTests"),
     ]
 )

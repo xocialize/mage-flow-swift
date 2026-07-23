@@ -54,12 +54,15 @@ public struct MageFlowPipeline {
         imgShapes: [(frame: Int, height: Int, width: Int)],
         scheduler: FlowMatchEulerScheduler,
         negTxt: MLXArray? = nil, cfg: Float = 1.0, renormalization: Bool = false,
-        onStep: ((Int, MLXArray) -> Void)? = nil
+        onStep: ((Int, MLXArray) -> Void)? = nil,
+        shouldStop: (() -> Bool)? = nil
     ) -> MLXArray {
         var img = img0
         let refs = img0.dim(1) > targetLen ? img0[0..., targetLen..., 0...] : nil
         let useCFG = cfg > 1.0 && negTxt != nil
         for i in 0 ..< scheduler.timesteps.count {
+            // cooperative-cancellation seam (CAN gate): break, caller classifies
+            if shouldStop?() == true { break }
             let v: MLXArray
             if useCFG {
                 v = velocityCFG(img: img, txt: txt, negTxt: negTxt!, sigma: scheduler.sigma(i),

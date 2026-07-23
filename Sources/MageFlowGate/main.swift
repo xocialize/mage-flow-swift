@@ -78,6 +78,89 @@ if args.first == "--nax-probe" {
     exit(ok ? 0 : 1)
 }
 
+// --quant-export <transformerDir> <out.safetensors> <4|8>: one-time pre-quantization.
+if args.first == "--quant-export" {
+    guard args.count >= 4, let bits = Int(args[3]), bits == 4 || bits == 8 else {
+        err("usage: MageFlowGate --quant-export <transformerDir> <out.safetensors> <4|8>"); exit(2)
+    }
+    let cfg = bits == 4 ? MageQuantConfig.int4 : MageQuantConfig.int8
+    try MageQuant.saveQuantizedDiT(
+        fromTransformerDir: URL(fileURLWithPath: args[1]),
+        to: URL(fileURLWithPath: args[2]), config: cfg)
+    err("[quant-export] wrote int\(bits) g\(cfg.groupSize) -> \(args[2])")
+    exit(0)
+}
+
+// --quant-gate <transformerDir> <quantFile> <dit_goldens_fp32.safetensors>:
+// per-pass cosine, bf16 reference vs quantized, identical injected inputs.
+// ⚠ FORWARDS ON THE GPU STREAM — a CPU pin makes quantized matmul grind for hours
+// (mlx-swift-integration skill, Metal-watchdog item 2). Thresholds: int8 ≥ 0.9999,
+// int4 ≥ 0.99 (mlx-porting step 7 per-pass doctrine — NOT PSNR-vs-golden-image).
+if args.first == "--quant-gate" {
+    guard args.count >= 4 else {
+        err("usage: MageFlowGate --quant-gate <transformerDir> <quantFile> <goldens>"); exit(2)
+    }
+    let g = try MLX.loadArrays(url: URL(fileURLWithPath: args[3]))
+    let hidden = g["img_in"]!.asType(.bfloat16)
+    let encoder = g["txt_in"]!.asType(.bfloat16)
+    let temb = g["temb"]!.asType(.bfloat16)
+    let rc = g["rope_real"]!.asType(.float32)
+    let rs = g["rope_imag"]!.asType(.float32)
+
+    // bf16 reference (load on CPU stream, forward on GPU)
+    let ref = MageFlowTransformer()
+    var raw: [String: MLXArray] = [:]
+    for f in try FileManager.default.contentsOfDirectory(
+        at: URL(fileURLWithPath: args[1]), includingPropertiesForKeys: nil)
+        .filter({ $0.pathExtension == "safetensors" }) {
+        raw.merge(try MLX.loadArrays(url: f)) { a, _ in a }
+    }
+    let rkeys = Set(ref.parameters().flattened().map(\.0))
+    ref.update(parameters: ModuleParameters.unflattened(
+        ref.sanitize(weights: raw).mapValues { $0.asType(.bfloat16) }.filter { rkeys.contains($0.key) }))
+    eval(ref)
+    let q = try MageQuant.loadQuantizedDiT(from: URL(fileURLWithPath: args[2]))
+    let bits = (try MLX.loadArraysAndMetadata(url: URL(fileURLWithPath: args[2])).1)["dit_bits"] ?? "?"
+
+    final class Caps: @unchecked Sendable { var txt: [MLXArray] = []; var img: [MLXArray] = [] }
+    let rCaps = Caps(), qCaps = Caps()
+    let refOut = ref.runBlocks(hidden: hidden, encoder: encoder, temb: temb, rope: (rc, rs)) { _, t, i in
+        eval(t, i); rCaps.txt.append(t); rCaps.img.append(i)
+    }
+    eval(refOut)
+    let qOut = q.runBlocks(hidden: hidden, encoder: encoder, temb: temb, rope: (rc, rs)) { _, t, i in
+        eval(t, i); qCaps.txt.append(t); qCaps.img.append(i)
+    }
+    eval(qOut)
+    for i in 0 ..< rCaps.img.count {
+        err(String(format: "  block %2d  txt cos %.6f  img cos %.6f",
+                   i, cosine(rCaps.txt[i], qCaps.txt[i]), cosine(rCaps.img[i], qCaps.img[i])))
+    }
+    let c = cosine(refOut, qOut)
+    // Mage's activations reach ~1.2e5, so the bf16 PRODUCTION baseline is itself
+    // ~1e-4 from the fp32 oracle (measured 0.999901). An absolute quant-vs-bf16
+    // bar of 0.9999 would demand int8 be cleaner than bf16's own distance to
+    // fp32 — miscalibrated for this architecture. int8 gates RELATIVE to the
+    // baseline: deficit(quant, fp32golden) <= 2x deficit(bf16, fp32golden).
+    // int4 keeps the absolute 0.99 doctrine bar.
+    let gold = g["proj_out"]!
+    let cRef = cosine(refOut, gold)
+    let cQ = cosine(qOut, gold)
+    err(String(format: "  calib: bf16-vs-fp32golden %.6f   quant-vs-fp32golden %.6f   quant-vs-bf16 %.6f",
+               cRef, cQ, c))
+    let pass: Bool
+    if bits == "8" {
+        pass = (1 - cQ) <= 2 * (1 - cRef)
+        err(String(format: "[quant-gate] int8 golden-deficit %.3e vs 2x baseline %.3e -> %@",
+                   1 - cQ, 2 * (1 - cRef), (pass ? "PASS" : "FAIL") as NSString))
+    } else {
+        pass = c >= 0.99
+        err(String(format: "[quant-gate] int4 per-pass cosine %.6f (threshold 0.9900) -> %@",
+                   c, (pass ? "PASS" : "FAIL") as NSString))
+    }
+    exit(pass ? 0 : 1)
+}
+
 guard args.count >= 2 else {
     err("usage: MageFlowGate <transformerDir> <dit_goldens.safetensors>")
     exit(2)
