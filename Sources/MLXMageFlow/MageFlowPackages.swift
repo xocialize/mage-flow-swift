@@ -116,16 +116,16 @@ final class MageFlowRuntime {
 enum MageFlowManifest {
     // Split footprint (efficiency contract 1.14.0), resident-conditioner path at the
     // 1024² envelope. Resident = DiT tier + Qwen3-VL-4B (8.3 GB) + MageVAE (0.33 GB);
-    // DiT tiers measured from the shipped artifacts: bf16 7.7 / int8 5.2 / int4 4.0 GB
-    // (int8/int4 keep mods + block 11 bf16 — the gated recipe). Activation measured
-    // via GPU.peakMemory minus resident: 2.2 GB @512² → ~3.7 GB @1024² (edit path).
-    // Smoke cross-check @512²: peaks 18.50 / 16.37 / 14.92 GB = resident + 2.2 ✓.
-    // The conditioner-evict light tier is surfaced dynamically via
-    // MageFlowConfiguration.FootprintConfigured hints (int4 floor 4.4 GB).
+    // DiT tiers from the shipped artifacts: bf16 7.7 / int8 5.6 (g32) / int4 4.3 GB
+    // (int8/int4 keep mods + block 11 bf16 — the gated recipe). Activation ~3.7 GB
+    // at the 1024² envelope (edit path ≈ 2× t2i tokens; declared for edit).
+    // Measured GPU peaks, t2i @1024²: bf16 19.59 / int8 17.15 / int4 16.08 GB ✓
+    // (and @512² edit: 18.50 / 16.37 / 14.92). The conditioner-evict light tier is
+    // surfaced dynamically via MageFlowConfiguration.FootprintConfigured hints.
     static let footprints = [
         QuantFootprint(quant: .bf16, residentBytes: 16_400_000_000, peakActivationBytes: 3_700_000_000),
-        QuantFootprint(quant: .int8, residentBytes: 13_900_000_000, peakActivationBytes: 3_700_000_000),
-        QuantFootprint(quant: .int4, residentBytes: 12_700_000_000, peakActivationBytes: 3_700_000_000),
+        QuantFootprint(quant: .int8, residentBytes: 14_200_000_000, peakActivationBytes: 3_700_000_000),
+        QuantFootprint(quant: .int4, residentBytes: 12_900_000_000, peakActivationBytes: 3_700_000_000),
     ]
 
     static func requirements() -> RequirementsManifest {

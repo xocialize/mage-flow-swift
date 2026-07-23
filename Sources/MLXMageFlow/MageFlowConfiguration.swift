@@ -123,10 +123,11 @@ public struct MageFlowConfiguration: PackageConfiguration, ModelStorable, QuantC
     //    2.2 GB @512² → 3.7 GB @1024² → 8.8 GB @2048², edit path ≈ 2× tokens).
     public var residentBytesHint: UInt64? {
         guard evictConditioner else { return nil }
-        // DiT (per tier) + VAE floor; the conditioner is transient.
+        // DiT (per tier: bf16 7.7 / int8-g32 5.6 / int4 4.3 GB) + VAE floor;
+        // the conditioner is transient.
         switch quant {
-        case .int8: return 5_600_000_000
-        case .int4: return 4_400_000_000
+        case .int8: return 6_000_000_000
+        case .int4: return 4_700_000_000
         default: return 8_100_000_000
         }
     }

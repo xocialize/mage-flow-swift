@@ -148,6 +148,17 @@ if args.first == "--quant-gate" {
     let cQ = cosine(qOut, gold)
     err(String(format: "  calib: bf16-vs-fp32golden %.6f   quant-vs-fp32golden %.6f   quant-vs-bf16 %.6f",
                cRef, cQ, c))
+    // Family mode (5th arg "rel"): the fp32 golden proj_out is only valid for the
+    // flagship Edit-Turbo weights. For sibling checkpoints gate ABSOLUTE
+    // quant-vs-bf16, thresholds transferred from the flagship's gated recipe
+    // (int8 measured 0.999882, int4 0.9911).
+    if args.count > 4, args[4] == "rel" {
+        let t: Float = bits == "8" ? 0.9998 : 0.99
+        let ok = c >= t
+        err(String(format: "[quant-gate] int%@ quant-vs-bf16 %.6f (family threshold %.4f) -> %@",
+                   bits as NSString, c, t, (ok ? "PASS" : "FAIL") as NSString))
+        exit(ok ? 0 : 1)
+    }
     let pass: Bool
     if bits == "8" {
         pass = (1 - cQ) <= 2 * (1 - cRef)
