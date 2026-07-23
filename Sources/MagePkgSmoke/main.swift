@@ -15,6 +15,24 @@ import MLXToolKit
 func die(_ s: String) -> Never { FileHandle.standardError.write(Data((s + "\n").utf8)); exit(2) }
 
 let args = Array(CommandLine.arguments.dropFirst())
+// probe-dl <repo> <glob> — download one source into a temp store, printing
+// progress samples (MAGE_MAT_DEBUG=1). Diagnoses single-file progress granularity.
+if args.first == "probe-dl", args.count >= 3 {
+    let tmp = FileManager.default.temporaryDirectory
+        .appendingPathComponent("mage-dl-probe-\(UUID().uuidString)")
+    defer { try? FileManager.default.removeItem(at: tmp) }
+    try await WeightDownloadProgress.$sink.withValue({ fraction, bps in
+        FileHandle.standardError.write(Data(String(format: "[dl] frac=%.4f MB/s=%.1f\n",
+            fraction, (bps ?? 0) / 1_048_576).utf8))
+    }) {
+        try await WeightMaterializer.materialize(
+            [WeightSource(role: "probe", repo: args[1], revision: nil, matching: [args[2]])],
+            into: tmp)
+    }
+    print("PROBE DONE")
+    exit(0)
+}
+
 guard args.count >= 2 else { die("usage: mage-pkg-smoke <snapshotRoot> t2i|edit [ref.png] [quant] [out.png]") }
 let root = args[0], surface = args[1]
 let refPath = args.count > 2 ? args[2] : nil
