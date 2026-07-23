@@ -845,3 +845,28 @@ K ≥ 3·max(M,N).
   `down_proj` workaround. **bf16 is the default again** (1.1s vs 2.4s fp32 at
   512², half the memory); `MAGEFLOW_FP32` kept for parity work. Remove the chunk
   when mlx-swift ships mlx ≥ #3810.
+
+### #3810 backport VALIDATED on this machine (2026-07-22)
+
+The fix is 4 lines, all in the JIT-only path: the JIT kernel template was
+instantiated with the **output** dtype (`C_split`, the fp32 split-K accumulator)
+instead of the **input** dtype (bf16) — the JIT-compiled kernel read bf16 inputs
+as fp32. That is why AOT metallib (Python wheels) was always clean and mlx-swift
+(`MLX_METAL_JIT=ON`) was garbage.
+
+A/B/A on mlx-swift 0.31.6 via `swift package edit` against a local checkout with
+the 4-line backport (clone at `WIP/mlx-swift-3810`):
+
+| kernel | M=1366 | M=2048 | bf16 CLI, `MAGEFLOW_NO_CHUNK=1` |
+|---|---|---|---|
+| stock 0.31.6 | cos 0.998, max_abs 1.3e4 | **NaN**, 2.2e37 | (grid garbage) |
+| **+ #3810 backport** | cos 0.9999988 | cos 0.9999988 | **clean edit** |
+| stock again (unedit) | BROKEN | BROKEN | — |
+
+⚠ Note the **M=1366 row: cos 0.998 is SUBTLE corruption** right past the
+dispatch boundary — a loose (≥0.99) gate passes it. Probe with strict
+thresholds (`MageFlowGate --nax-probe`, cos > 0.999 AND max_abs < 100).
+
+Shipped code keeps the row-chunk (correct on stock AND fixed kernels). After any
+mlx-swift version bump: run `--nax-probe`; on PASS, delete `downProjected` here
+and `MLP.downProjected` in qwen3vl-mlx-swift.

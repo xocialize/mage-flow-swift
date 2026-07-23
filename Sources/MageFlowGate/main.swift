@@ -46,6 +46,38 @@ func check(_ name: String, _ a: MLXArray, _ g: MLXArray) {
 }
 
 let args = Array(CommandLine.arguments.dropFirst())
+// Weights-free NAX split-K GEMM probe at the exact Mage DiT FFN shapes.
+// mlx-swift <=0.31.6 JIT-miscompiles steel_gemm_splitk_axpby_nax (mlx#3797,
+// fixed by mlx#3810): M=896 clean / M>=1024 garbage. Run after any mlx-swift
+// bump to decide whether MageFeedForward.downProjected can drop its row-chunk.
+//   MageFlowGate --nax-probe
+if args.first == "--nax-probe" {
+    var lcg: UInt64 = 0x9E37_79B9_7F4A_7C15
+    func rand(_ n: Int) -> [Float] {
+        (0 ..< n).map { _ in
+            lcg = lcg &* 6_364_136_223_846_793_005 &+ 1_442_695_040_888_963_407
+            return Float(Int64(bitPattern: lcg >> 11)) / Float(Int64.max >> 11)
+        }
+    }
+    let (K, N) = (12288, 3072)   // Mage DiT FFN proj_out
+    let b = MLXArray(rand(N * K), [N, K]).asType(.bfloat16)
+    var ok = true
+    for m in [512, 896, 1024, 1366, 2048] {
+        let a = MLXArray(rand(m * K), [m, K]).asType(.bfloat16)
+        let y = matmul(a, b.T)
+        let yRef = matmul(a.asType(.float32), b.asType(.float32).T)
+        eval(y, yRef)
+        let mab = abs(y.asType(.float32) - yRef).max().item(Float.self)
+        let c = cosine(y, yRef)
+        let pass = c > 0.999 && mab.isFinite && mab < 100
+        if !pass { ok = false }
+        err(String(format: "  M=%d K=%d N=%d bf16: cos %.8f max_abs %.3e  %@",
+                   m, K, N, c, mab, (pass ? "OK" : "BROKEN") as NSString))
+    }
+    err("[nax-probe] \(ok ? "PASS — kernel fixed, row-chunk removable" : "FAIL — keep the row-chunk")")
+    exit(ok ? 0 : 1)
+}
+
 guard args.count >= 2 else {
     err("usage: MageFlowGate <transformerDir> <dit_goldens.safetensors>")
     exit(2)

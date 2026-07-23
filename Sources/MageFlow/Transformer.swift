@@ -218,6 +218,9 @@ public final class MageFeedForward: Module, UnaryLayer {
     /// Fixed upstream in ml-explore/mlx#3810 (2026-07-07); remove once an
     /// mlx-swift release ships it (latest 0.31.6 predates the fix).
     func downProjected(_ x: MLXArray) -> MLXArray {
+        // MAGEFLOW_NO_CHUNK disables the workaround — for validating a fixed
+        // mlx-swift (run `MageFlowGate --nax-probe` first).
+        if ProcessInfo.processInfo.environment["MAGEFLOW_NO_CHUNK"] != nil { return projOut(x) }
         let tokens = x.dim(-2)
         let rowLimit = 896
         guard x.dtype != .float32, tokens > rowLimit else { return projOut(x) }
