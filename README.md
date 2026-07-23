@@ -45,11 +45,17 @@ Qwen3-VL-4B conditioning + the content filter come from
 
 ## Notes that cost real debugging (full detail in `PORTING-SPEC.md`)
 
-- **The DiT runs in fp32 on the edit path.** bf16 weights load fine, but the
-  MLX-Swift bf16 attention/GEMM produces grid garbage at ≥512² on Apple GPUs
-  (the same failure that makes Boogu-Image use `useFP32DiT: true`; upstream runs
-  bf16 cleanly on CUDA, so it's a Metal-kernel issue, not the math). `MAGEFLOW_BF16`
-  opts back in once a surgical fix (fp32 SDPA only) lands.
+- **The bf16 "grid garbage at ≥512²" was the mlx-swift NAX split-K GEMM bug**
+  ([ml-explore/mlx#3797](https://github.com/ml-explore/mlx/issues/3797), fixed
+  upstream by [#3810](https://github.com/ml-explore/mlx/pull/3810) but not yet
+  in an mlx-swift release ≤0.31.6): mlx-swift JIT-compiles
+  `steel_gemm_splitk_axpby_nax` and the 26.x/27.x Metal toolchain miscompiles it
+  on M5-class GPUs. The DiT's FFN `proj_out` (K=12288, N=3072) enters the
+  dispatch window at 1366 image tokens — a 512² edit packs 2048.
+  `MageFeedForward.downProjected` row-chunks below the boundary (exact), so the
+  DiT now **runs bf16 by default** (~2× faster than fp32, half the memory);
+  `MAGEFLOW_FP32` remains for parity work. Same root cause as Boogu-Image's
+  `useFP32DiT` and qwen3vl's `down_proj` chunking.
 - **The timestep embedding is bf16-rounded twice** — the sigma *and* the
   frequency table. At scale-1000 sinusoid arguments a 0.2% bf16 shift moves
   cos/sin by radians. Layer parity was perfect (6.8e-6) yet the sampler was

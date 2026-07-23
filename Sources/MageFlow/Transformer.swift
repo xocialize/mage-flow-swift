@@ -205,7 +205,30 @@ public final class MageFeedForward: Module, UnaryLayer {
         super.init()
     }
     public func callAsFunction(_ x: MLXArray) -> MLXArray {
-        projOut(geluApproximate(projIn(x)))
+        downProjected(geluApproximate(projIn(x)))
+    }
+
+    /// mlx-swift ≤0.31.6 JIT-compiles `steel_gemm_splitk_axpby_nax` (dispatched at
+    /// M·N ≥ 2048², K ≥ 10240, K ≥ 3·max(M,N)) and the 26.x/27.x Metal toolchain
+    /// miscompiles it on M5-class GPUs → garbage/NaN. This proj_out
+    /// (K=12288, N=3072) crosses the boundary at 1366 image tokens — a 512² edit
+    /// packs 2048 — which is exactly the "bf16 DiT grid garbage on the edit path".
+    /// Chunk rows below the threshold: output rows are independent, so this is
+    /// mathematically exact. Same workaround as qwen3vl-mlx-swift's down_proj.
+    /// Fixed upstream in ml-explore/mlx#3810 (2026-07-07); remove once an
+    /// mlx-swift release ships it (latest 0.31.6 predates the fix).
+    func downProjected(_ x: MLXArray) -> MLXArray {
+        let tokens = x.dim(-2)
+        let rowLimit = 896
+        guard x.dtype != .float32, tokens > rowLimit else { return projOut(x) }
+        var parts: [MLXArray] = []
+        var start = 0
+        while start < tokens {
+            let end = min(start + rowLimit, tokens)
+            parts.append(projOut(x[.ellipsis, start ..< end, 0...]))
+            start = end
+        }
+        return concatenated(parts, axis: -2)
     }
 }
 

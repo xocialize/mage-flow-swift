@@ -821,3 +821,27 @@ monkey-patches `Qwen3VLTextModel.forward` and `Qwen3VLTextAttention.forward`.
 
 Weights: `HF_HOME=/Volumes/Satechi/hf-cache` (the home volume is at 74%;
 the dev volume has 3.6 TB free).
+
+
+## The bf16 "grid garbage" was the NAX split-K GEMM JIT bug — SOLVED
+
+The assembled CLI's bf16 grid garbage at 512² (and Boogu's `useFP32DiT`) is the
+**same single bug**: mlx-swift ≤0.31.6 JIT-compiles `steel_gemm_splitk_axpby_nax`
+(`MLX_METAL_JIT=ON`) and the 26.x/27.x Metal toolchain miscompiles it on
+M5-class GPUs. Dispatch window: half precision, M·N ≥ 2048², K ≥ 10240,
+K ≥ 3·max(M,N).
+
+- **Verified live 2026-07-22** (`Qwen3VLGate --matmul-probe-rand`): M=896 clean,
+  M=1024 → NaN, max_abs 1.4e36. Python mlx 0.32.0 (AOT metallib wheel) is clean
+  on identical shapes including the exact Mage FFN shape.
+- **Why Mage hit it:** DiT FFN `proj_out` K=12288, N=3072 enters the window at
+  **1366 image tokens**; a 512² edit packs 2048 (target+ref — which is why it was
+  edit-path-specific). No other DiT GEMM qualifies (all K=3072).
+- **Upstream:** ml-explore/mlx#3797 (filed from this machine), closed COMPLETED
+  by PR #3810 (wrong type parameter, merged 2026-07-07). **No mlx-swift release
+  ships it yet** — 0.31.6 is 2026-07-02.
+- **Fix here:** `MageFeedForward.downProjected` row-chunks at 896 rows
+  (mathematically exact — output rows independent), mirroring qwen3vl's
+  `down_proj` workaround. **bf16 is the default again** (1.1s vs 2.4s fp32 at
+  512², half the memory); `MAGEFLOW_FP32` kept for parity work. Remove the chunk
+  when mlx-swift ships mlx ≥ #3810.

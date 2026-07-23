@@ -86,13 +86,12 @@ public final class MageFlowEditPipeline {
             raw.merge(try MLX.loadArrays(url: f)) { x, _ in x }
         }
         let keys = Set(model.parameters().flattened().map(\.0))
-        // The DiT runs in fp32 on the edit path. bf16 weights load fine, but the
-        // MLX-Swift bf16 attention/GEMM produces grid garbage at >=512^2 on Apple
-        // GPUs (same failure Boogu-Image hits -> useFP32DiT: true; upstream runs
-        // bf16 on CUDA cleanly, so this is a Metal-kernel issue, not the math).
-        // Opt back into bf16 with MAGEFLOW_BF16 once a surgical fix (fp32 SDPA
-        // only, or per-block eval) lands.
-        let ditDtype: DType = ProcessInfo.processInfo.environment["MAGEFLOW_BF16"] != nil ? .bfloat16 : .float32
+        // bf16 by default (upstream dtype). The former "grid garbage at >=512^2"
+        // was root-caused to the mlx-swift <=0.31.6 JIT-miscompiled NAX split-K
+        // GEMM (ml-explore/mlx#3797, fixed by #3810) hitting the FFN proj_out at
+        // >=1366 image tokens; MageFeedForward.downProjected now row-chunks
+        // around it exactly. MAGEFLOW_FP32 remains for parity work.
+        let ditDtype: DType = ProcessInfo.processInfo.environment["MAGEFLOW_FP32"] != nil ? .float32 : .bfloat16
         let w = model.sanitize(weights: raw).mapValues { $0.asType(ditDtype) }
         let missing = keys.subtracting(Set(w.keys))
         guard missing.isEmpty else { throw MageFlowEditError.load("DiT missing \(missing.count) keys") }
