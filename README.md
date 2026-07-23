@@ -16,8 +16,19 @@ swift build -c release
 ```
 
 `<snapshot dir>` is a downloaded `microsoft/Mage-Flow-Edit-*` repo plus a
-`folded_adaln.safetensors` at its root (produced by the port's
-`dump_folded_adaln.py` — the VAE adaLN constants, baked once).
+`folded_adaln.safetensors` at its root. The baked artifact + a ready model card
+live at **[xocialize/Mage-Flow-Edit-Turbo-mlx](https://huggingface.co/xocialize/Mage-Flow-Edit-Turbo-mlx)**
+(`Weights/folded_adaln.safetensors` here is the same file); regenerate with
+`Weights/dump_folded_adaln.py`.
+
+## Scope
+
+`Mage-Flow-Edit-Turbo` (4-step, cfg 1.0) is validated end-to-end. The other five
+family checkpoints share every parity-locked component (VAE, DiT architecture,
+Qwen3-VL, scheduler) but are **not yet runnable** here: the Base/RL edit
+checkpoints need the CFG / `batch_cfg` denoise path (cfg > 1), and the three
+T2I checkpoints need the text-to-image path (no reference image, `start_idx=34`
+template). Both are the next steps.
 
 ## Components (all parity-locked vs the PyTorch oracle, CPU stream)
 
