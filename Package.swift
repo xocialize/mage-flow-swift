@@ -25,10 +25,10 @@ let package = Package(
         .package(url: "https://github.com/xocialize/qwen3vl-mlx-swift.git", from: "0.2.0"),
         .package(url: "https://github.com/huggingface/swift-transformers", from: "1.3.3"),
         .package(url: "https://github.com/ml-explore/mlx-swift-lm.git", from: "3.31.3"),
-        // ≥0.27.0 for the CAN cancellation gate (MLXServeConformance.CancellationConformance).
-        .package(url: "https://github.com/xocialize/mlx-engine-swift", from: "0.27.0"),
+        // ≥0.32.0 for engine-executed first-run materialization (contract 1.24.0);
+        // the package no longer carries its own WeightMaterializer.
+        .package(url: "https://github.com/xocialize/mlx-engine-swift", from: "0.32.0"),
         .package(url: "https://github.com/xocialize/mlx-profiling.git", from: "0.1.0"),
-        .package(url: "https://github.com/huggingface/swift-huggingface", from: "0.9.0"),
     ],
     targets: [
         .target(
@@ -69,12 +69,15 @@ let package = Package(
                 .product(name: "MLX", package: "mlx-swift"),
                 .product(name: "MLXToolKit", package: "mlx-engine-swift"),
                 .product(name: "MLXProfiling", package: "mlx-profiling"),
-                .product(name: "HuggingFace", package: "swift-huggingface"),
             ],
             path: "Sources/MLXMageFlow"),
         .executableTarget(
             name: "mage-pkg-smoke",
-            dependencies: ["MLXMageFlow"],
+            dependencies: [
+                "MLXMageFlow",
+                // probe-dl drives the engine's materialization executor directly.
+                .product(name: "MLXServeCore", package: "mlx-engine-swift"),
+            ],
             path: "Sources/MagePkgSmoke"),
         .testTarget(
             name: "MLXMageFlowTests",

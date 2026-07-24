@@ -62,13 +62,15 @@ final class MaterializationTests: XCTestCase {
         defer { try? FileManager.default.removeItem(at: root) }
         let cfg = MageFlowConfiguration(variant: .turbo, quant: .int8)
         XCTAssertEqual(cfg.missingWeightSources(storeRoot: root).count, 2)
-        // Materialize both sources in the store layout.
-        let comp = root.appending(path: "microsoft/Mage-Flow-Turbo")
+        // Materialize both sources in the store layout — paths from ModelStore so the
+        // fixture tracks the engine's canonical convention (models--org--name since 1.22).
+        let store = ModelStore(root: root)
+        let comp = store.directory(for: "microsoft/Mage-Flow-Turbo")!
         for sub in ["text_encoder", "vae"] {
             try FileManager.default.createDirectory(
                 at: comp.appending(path: sub), withIntermediateDirectories: true)
         }
-        let arts = root.appending(path: "xocialize/Mage-Flow-Turbo-mlx")
+        let arts = store.directory(for: "xocialize/Mage-Flow-Turbo-mlx")!
         try FileManager.default.createDirectory(at: arts, withIntermediateDirectories: true)
         FileManager.default.createFile(
             atPath: arts.appending(path: "folded_adaln.safetensors").path, contents: Data())

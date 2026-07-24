@@ -10,13 +10,16 @@
 
 import Foundation
 import MLXMageFlow
+import MLXServeCore
 import MLXToolKit
 
 func die(_ s: String) -> Never { FileHandle.standardError.write(Data((s + "\n").utf8)); exit(2) }
 
 let args = Array(CommandLine.arguments.dropFirst())
 // probe-dl <repo> <glob> — download one source into a temp store, printing
-// progress samples (MAGE_MAT_DEBUG=1). Diagnoses single-file progress granularity.
+// progress samples. Diagnoses single-file progress granularity. Since engine
+// 0.32.0 this drives MLXServeCore.WeightMaterializer (the engine executor that
+// replaced the package-local copy), so the probe exercises the shipping path.
 if args.first == "probe-dl", args.count >= 3 {
     let tmp = FileManager.default.temporaryDirectory
         .appendingPathComponent("mage-dl-probe-\(UUID().uuidString)")
@@ -25,7 +28,7 @@ if args.first == "probe-dl", args.count >= 3 {
         FileHandle.standardError.write(Data(String(format: "[dl] frac=%.4f MB/s=%.1f\n",
             fraction, (bps ?? 0) / 1_048_576).utf8))
     }) {
-        try await WeightMaterializer.materialize(
+        try await WeightMaterializer().materialize(
             [WeightSource(role: "probe", repo: args[1], revision: nil, matching: [args[2]])],
             into: tmp)
     }

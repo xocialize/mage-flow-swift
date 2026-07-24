@@ -42,18 +42,10 @@ final class MageFlowRuntime {
         guard pipeline == nil else { return }
         let cfg = configuration
 
-        // v0.19.0 auto-materialization: download any missing declared sources into
-        // the store layout (WeightMaterializer forwards WeightDownloadProgress, so
-        // the engine surfaces a real .downloading phase). Explicit-snapshot and
-        // already-materialized configs skip this entirely (no network).
-        let missing = cfg.missingWeightSources(storeRoot: cfg.modelsRootDirectory)
-        if !missing.isEmpty {
-            guard let root = cfg.modelsRootDirectory else {
-                throw WeightMaterializer.MaterializeError.noStoreRoot
-            }
-            try await WeightMaterializer.materialize(missing, into: root)
-        }
-
+        // First-run materialization is engine-executed since mlx-engine-swift 0.32.0
+        // (contract 1.24.0): resident()/prepare() downloads missing WeightSourcing
+        // sources before load() runs. The guard below stays as the offline backstop —
+        // absent weights with no store root still fail legibly here.
         guard let snapshot = cfg.resolvedSnapshotDirectory(storeRoot: cfg.modelsRootDirectory),
               FileManager.default.fileExists(atPath: snapshot.appendingPathComponent("text_encoder").path)
         else { throw MageFlowPackageError.unreadableSnapshot(cfg.snapshotPath ?? cfg.variant.componentsRepo) }
