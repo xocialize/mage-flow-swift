@@ -18,7 +18,11 @@ let package = Package(
     ],
     dependencies: [
         .package(url: "https://github.com/ml-explore/mlx-swift.git", from: "0.31.4"),
-        .package(url: "https://github.com/xocialize/qwen3vl-mlx-swift.git", branch: "main"),
+        // qwen3vl carries the parity-locked conditioner + content-filter backbone — pin by
+        // VERSION, not branch: a branch dep silently drifts off validated behavior AND makes
+        // this package unresolvable as a versioned dependency (SwiftPM rejects branch deps
+        // inside version-pinned packages). v0.2.0 == the flatPositionIds + generate-loop rev.
+        .package(url: "https://github.com/xocialize/qwen3vl-mlx-swift.git", from: "0.2.0"),
         .package(url: "https://github.com/huggingface/swift-transformers", from: "1.3.3"),
         .package(url: "https://github.com/ml-explore/mlx-swift-lm.git", from: "3.31.3"),
         // ≥0.27.0 for the CAN cancellation gate (MLXServeConformance.CancellationConformance).
