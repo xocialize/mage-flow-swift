@@ -73,6 +73,10 @@ public struct MageFlowConfiguration: PackageConfiguration, ModelStorable, QuantC
     /// (it reloads on the next request) — resident set becomes DiT + VAE, so the
     /// low-RAM peak ≈ max(encode, denoise) instead of conditioner + denoise.
     public var evictConditioner: Bool
+    /// Bypass the mandatory Responsible-AI content filter (parity with the CLI's
+    /// `--no-filter`). Default false — the fail-closed screen runs. When true the
+    /// `screen` step is skipped entirely; intended for local development/testing.
+    public var bypassContentFilter: Bool
     public var modelsRootDirectory: URL?
 
     public init(
@@ -83,6 +87,7 @@ public struct MageFlowConfiguration: PackageConfiguration, ModelStorable, QuantC
         guidanceScale: Float? = nil,
         defaultSize: Int = 1024,
         evictConditioner: Bool = false,
+        bypassContentFilter: Bool = false,
         modelsRootDirectory: URL? = nil
     ) {
         self.variant = variant
@@ -92,11 +97,13 @@ public struct MageFlowConfiguration: PackageConfiguration, ModelStorable, QuantC
         self.guidanceScale = guidanceScale ?? variant.defaultGuidance
         self.defaultSize = defaultSize
         self.evictConditioner = evictConditioner
+        self.bypassContentFilter = bypassContentFilter
         self.modelsRootDirectory = modelsRootDirectory
     }
 
     private enum CodingKeys: String, CodingKey {
         case variant, quant, defaultSteps, guidanceScale, defaultSize, evictConditioner
+        case bypassContentFilter
     }
 
     public init(from decoder: Decoder) throws {
@@ -108,6 +115,7 @@ public struct MageFlowConfiguration: PackageConfiguration, ModelStorable, QuantC
         guidanceScale = try c.decodeIfPresent(Float.self, forKey: .guidanceScale) ?? v.defaultGuidance
         defaultSize = try c.decodeIfPresent(Int.self, forKey: .defaultSize) ?? 1024
         evictConditioner = try c.decodeIfPresent(Bool.self, forKey: .evictConditioner) ?? false
+        bypassContentFilter = try c.decodeIfPresent(Bool.self, forKey: .bypassContentFilter) ?? false
     }
 
     /// The pre-quantized DiT filename in the artifacts repo (nil for bf16).

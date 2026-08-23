@@ -95,15 +95,17 @@ final class MageFlowRuntime {
             prof.endRun(denominators: ["step": Double(pipeline.cfg.steps)])
             if cfg.evictConditioner { pipeline.dropConditioner() }
         }
+        // The Responsible-AI screen runs unless the caller opted to bypass it.
+        let screen = !cfg.bypassContentFilter
         do {
             let nhwc: MLXArray
             if let refImage {
                 let (rgb, w, h) = try MageFlowEditPipeline.decodeRGB(data: refImage.data)
                 nhwc = try pipeline.edit(refRGB: rgb, width: w, height: h,
-                                         instruction: prompt, screen: true,
+                                         instruction: prompt, screen: screen,
                                          shouldStop: { Task.isCancelled })
             } else {
-                nhwc = try pipeline.t2i(prompt: prompt, screen: true,
+                nhwc = try pipeline.t2i(prompt: prompt, screen: screen,
                                         shouldStop: { Task.isCancelled })
             }
             try Task.checkCancellation()
