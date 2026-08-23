@@ -46,7 +46,7 @@ final class MaterializationTests: XCTestCase {
         // bf16 pulls the transformer from the components repo…
         let bf16 = MageFlowConfiguration(variant: .editTurbo).weightSources
         XCTAssertEqual(bf16.map(\.role), ["components", "mlx-artifacts"])
-        XCTAssertEqual(bf16[0].repo, "microsoft/Mage-Flow-Edit-Turbo")
+        XCTAssertEqual(bf16[0].repo, "mage-flow-community/Mage-Flow-Edit-Turbo")
         XCTAssertTrue(bf16[0].matching!.contains("transformer/*"))
         XCTAssertEqual(bf16[1].repo, "xocialize/Mage-Flow-Edit-Turbo-mlx")
         XCTAssertEqual(bf16[1].matching, ["folded_adaln.safetensors"])
@@ -65,7 +65,7 @@ final class MaterializationTests: XCTestCase {
         // Materialize both sources in the store layout — paths from ModelStore so the
         // fixture tracks the engine's canonical convention (models--org--name since 1.22).
         let store = ModelStore(root: root)
-        let comp = store.directory(for: "microsoft/Mage-Flow-Turbo")!
+        let comp = store.directory(for: "mage-flow-community/Mage-Flow-Turbo")!
         for sub in ["text_encoder", "vae"] {
             try FileManager.default.createDirectory(
                 at: comp.appending(path: sub), withIntermediateDirectories: true)

@@ -2,7 +2,7 @@
 //
 // A Mage checkpoint is a multi-component snapshot: transformer/ (NR-MMDiT, bf16)
 // + text_encoder/ (Qwen3-VL-4B conditioner AND mandatory content filter) + vae/
-// (MageVAE) from the upstream microsoft repo, plus the port's artifacts from the
+// (MageVAE) from the upstream components repo, plus the port's artifacts from the
 // matching xocialize/<name>-mlx repo: folded_adaln.safetensors (baked MageVAE
 // adaLN constants) and, for quant tiers, a pre-quantized DiT
 // (transformer-int8/-int4.safetensors — loads with NO bf16 peak).
@@ -27,8 +27,13 @@ public enum MageFlowVariant: String, Codable, Sendable, CaseIterable {
         }
     }
 
-    /// Upstream component snapshot (MIT).
-    public var componentsRepo: String { "microsoft/\(rawValue)" }
+    /// Upstream component snapshot (MIT). ⚠️ MIGRATED 2026-08-23: the upstream org moved
+    /// `microsoft/<variant>` → `mage-flow-community/<variant>` (AB-A-0020) — the old org now
+    /// 401s even AUTHENTICATED listings, the new one is public-anonymous, so this REMOVES the
+    /// token requirement. Store note: the engine materializes under the DECLARED repo, so a
+    /// pre-migration store migrates by renaming `models--microsoft--<variant>` →
+    /// `models--mage-flow-community--<variant>` (presence check then short-circuits, no re-download).
+    public var componentsRepo: String { "mage-flow-community/\(rawValue)" }
     /// The port's artifact repo (folded adaLN + pre-quantized DiTs).
     public var artifactsRepo: String { "xocialize/\(rawValue)-mlx" }
 
@@ -51,7 +56,7 @@ public enum MageFlowVariant: String, Codable, Sendable, CaseIterable {
 public struct MageFlowConfiguration: PackageConfiguration, ModelStorable, QuantConfigured,
     FootprintConfigured {
     public var variant: MageFlowVariant
-    /// DiT quant tier. bf16 loads transformer/ from the microsoft snapshot; int8/int4
+    /// DiT quant tier. bf16 loads transformer/ from the components snapshot; int8/int4
     /// load the pre-quantized DiT from the artifacts repo (no bf16 peak, smaller download).
     /// Gate results (Edit-Turbo, per-pass vs fp32 golden): bf16 deficit 0.99e-4; int8 g32
     /// deficit 1.30e-4 (≤2× baseline — transparent); int4 g64 cos 0.9911 (e2e-validated).

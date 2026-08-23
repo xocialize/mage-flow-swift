@@ -153,7 +153,7 @@ public final class MageFlowT2IPackage: ModelPackage {
         PackageManifest(
             // Both layers MIT: microsoft weights + the xocialize port.
             license: LicenseDeclaration(weightLicense: .mit, portCodeLicense: .mit),
-            provenance: Provenance(sourceRepo: "microsoft/Mage-Flow", revision: "main", tier: 1),
+            provenance: Provenance(sourceRepo: "mage-flow-community/Mage-Flow", revision: "main", tier: 1),
             requirements: MageFlowManifest.requirements(),
             specialties: [],
             surfaces: [
@@ -220,7 +220,7 @@ public final class MageFlowEditPackage: ModelPackage {
     public nonisolated static var manifest: PackageManifest {
         PackageManifest(
             license: LicenseDeclaration(weightLicense: .mit, portCodeLicense: .mit),
-            provenance: Provenance(sourceRepo: "microsoft/Mage-Flow-Edit", revision: "main", tier: 1),
+            provenance: Provenance(sourceRepo: "mage-flow-community/Mage-Flow-Edit", revision: "main", tier: 1),
             requirements: MageFlowManifest.requirements(),
             specialties: [],
             surfaces: [

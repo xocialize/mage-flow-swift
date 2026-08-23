@@ -5,7 +5,7 @@
 //   [--size 512] [--seed 42] [--steps N] [--cfg F] [--neg "<negative>"] [--renorm] [--no-filter]
 //   Variant defaults: Base steps 30 / cfg 5.0 · RL steps 20 / cfg 5.0 · Turbo steps 4 / cfg 1.0
 //
-// <MageFlowEditRepoDir> is a downloaded microsoft/Mage-Flow-Edit* snapshot plus
+// <MageFlowEditRepoDir> is a downloaded mage-flow-community/Mage-Flow-Edit* snapshot plus
 // a folded_adaln.safetensors (from the port's dump_folded_adaln.py) at its root.
 
 import Foundation
