@@ -63,6 +63,9 @@ public struct MageFlowPipeline {
         for i in 0 ..< scheduler.timesteps.count {
             // cooperative-cancellation seam (CAN gate): break, caller classifies
             if shouldStop?() == true { break }
+            // 1-based "step i+1 is starting", reported at the same seam the cancel check sits
+            // on — the run's highest-value progress signal (contract 1.18.0).
+            MageProgress.report(.denoise, step: i + 1, totalSteps: scheduler.timesteps.count)
             let v: MLXArray
             if useCFG {
                 v = velocityCFG(img: img, txt: txt, negTxt: negTxt!, sigma: scheduler.sigma(i),

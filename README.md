@@ -82,6 +82,39 @@ Qwen3-VL-4B conditioning + the content filter come from
   off by 0.039 → 1.2 error while cosine read 1.00000000).
 - **`sample_posterior` is True at runtime** despite the config saying false.
 
+## Run-phase progress
+
+Both packages report into the engine's `RunProgress` plane (contract 1.18.0), so a
+consumer can show a real seam instead of one indeterminate "Generating…". The phases,
+in order:
+
+| phase | covers | steps? |
+|---|---|---|
+| `screen` | the mandatory Responsible-AI filter (AR verdict, fail-closed); carries the 8.3 GB conditioner load on the evicted tier. Absent when the caller bypasses the filter. | no |
+| `encode` | Qwen3-VL conditioning, the negative pass under CFG, and the MageVAE ref encode on the edit path | no |
+| `denoise` | the flow-matching Euler loop | **yes** — `step i/N`, 1-based |
+| `decode` | MageVAE decode to pixels — one eval, so no per-chunk cadence is claimed | no |
+| `postprocess` | PNG encode (reported by the wrapper, after the model is done) | no |
+
+`screen` is Mage's own phase name rather than one of the canonical constants: the filter
+is a gating classifier pass, not conditioning, and it is **not a rounding error in the
+run**. Measured, Turbo @512² on an M5 Max, warm:
+
+```
+edit  screen 4.1 s → encode 0.6 s → denoise 4 steps 1.5 s → decode 0.3 s   (10.0 s incl. 3.4 s load)
+t2i   screen 1.2 s → encode 0.1 s → denoise 4 steps 0.4 s → decode 0.1 s   ( 3.7 s incl. 1.9 s load)
+```
+
+On the 4-step Turbo tiers the content filter is the **largest** stage — a consumer that
+renders only denoise counters still shows a stalled-looking run for the first seconds. The
+20–30-step Base/RL tiers invert that balance (2 DiT forwards per step under CFG).
+
+The core stays engine-free: `MageFlow`/`MageFlowEdit` report into their own `MageProgress`
+task-local sink, and `MLXMageFlow` forwards those events into `RunProgress`
+(`MageProgressBridge`). Nothing bound ⇒ no-op, so the CLI and the gates run unchanged;
+`mage-pkg-smoke` binds a print sink the way the engine does and **fails** if the per-step
+denoise counters do not cover the loop.
+
 ## Gates
 
 Each gate drives one component against captured oracle goldens on the CPU stream,

@@ -281,11 +281,15 @@ public final class MageFlowEditPipeline {
     /// Text-to-image (Mage-Flow / -Base / -Turbo). Returns NHWC [1,H,W,3] in [-1,1].
     public func t2i(prompt: String, screen: Bool = true,
                     shouldStop: (() -> Bool)? = nil) throws -> MLXArray {
-        if screen { try screenT2I(prompt) }
+        if screen {
+            MageProgress.report(.screen)
+            try screenT2I(prompt)
+        }
         if shouldStop?() == true { throw CancellationError() }   // post-screen seam
         let side = (cfg.size / 16) * 16
         let (lh, lw) = (side / 16, side / 16)
 
+        MageProgress.report(.encode)
         let feats = try encodeT2I(prompt)
         let useCFG = cfg.cfg > 1.0 && !cfg.negPrompt.isEmpty
         let negFeats = useCFG ? try encodeT2I(cfg.negPrompt) : nil
@@ -306,6 +310,7 @@ public final class MageFlowEditPipeline {
         if shouldStop?() == true { throw CancellationError() }   // pre-decode seam
         let latent = out.reshaped(1, lh, lw, 128).asType(.float32)
         eval(latent)
+        MageProgress.report(.decode)
         let img = vaeDecode(latent, vae)
         eval(img)
         return img
@@ -356,6 +361,7 @@ public final class MageFlowEditPipeline {
         // edit refused with a self-contradictory rambling reason; upstream torch
         // passes the same input cleanly).
         if screen {
+            MageProgress.report(.screen)
             let (filterPixels, filterGrid) = imageProcessor.preprocess(rgb: rgb, width: iw, height: ih)
             let instr = instruction.trimmingCharacters(in: .whitespacesAndNewlines)
             let userText = "There is 1 source image(s) above. Edit instruction: "
@@ -392,6 +398,7 @@ public final class MageFlowEditPipeline {
             eval(f)
             return f
         }
+        MageProgress.report(.encode)
         let feats = try encodeEdit(instruction)
         // CFG (Base/RL): negative pass encodes the SAME ref image with the
         // negative instruction (upstream: edit_refs + edit_refs, pos + neg).
@@ -427,6 +434,7 @@ public final class MageFlowEditPipeline {
         eval(targetLatent)
 
         // --- decode -------------------------------------------------------
+        MageProgress.report(.decode)
         let img = vaeDecode(targetLatent, vae)
         eval(img)
         return img

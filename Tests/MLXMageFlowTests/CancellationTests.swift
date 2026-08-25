@@ -7,7 +7,8 @@
 //     conditioning encodes (MageFlowEditPipeline.t2i / .edit).
 //   - denoise/step — `if shouldStop?() == true { break }` at the top of the
 //     MageFlowPipeline.denoise loop (the one loop behind t2i AND edit, all tiers;
-//     non-throwing core API — sanctioned break).
+//     non-throwing core API — sanctioned break). The V2 `.denoise` step report sits
+//     on that same seam, so the cadence is RunProgress-evidenced (see RunProgressTests).
 //   - pre-decode seam — a cancelled task throws CancellationError before the
 //     monolithic MageVAE decode (ONE MLX eval; no per-chunk decode cadence claimed).
 //   - the wrapper's post-generate `try Task.checkCancellation()` and the pipeline's
@@ -49,7 +50,9 @@ final class CancellationTests: XCTestCase {
 
     private var posture: CancellationConformance.CheckpointPosture {
         .cadence([
-            .init(phase: .denoise, unit: .step)
+            // RunProgress-evidenced since the V2 adoption: the same loop seam reports
+            // `.denoise` step i/N, so the per-step yield point is observable, not just claimed.
+            .init(phase: .denoise, unit: .step, reportsRunProgress: true)
         ])
     }
 

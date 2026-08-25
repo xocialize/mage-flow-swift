@@ -43,6 +43,24 @@ let quant: Quant = args.count > 3 ? (args[3] == "int8" ? .int8 : args[3] == "int
 let outPath = args.count > 4 ? args[4] : "pkg_smoke.png"
 
 let t0 = Date()
+
+// Run-phase progress (contract 1.18.0, ENGINE-NEEDS V2): bind the plane the way
+// MLXServeEngine binds it around run(), so this gate is the live evidence that the
+// package reports phases — the offline suite can only prove the wrapper's mapping.
+final class PhaseLog: @unchecked Sendable {
+    private let lock = NSLock()
+    private var storage: [RunPhaseReport] = []
+    func append(_ r: RunPhaseReport) { lock.lock(); storage.append(r); lock.unlock() }
+    var items: [RunPhaseReport] { lock.lock(); defer { lock.unlock() }; return storage }
+}
+let phases = PhaseLog()
+let progressSink: RunProgress.Sink = { r in
+    phases.append(r)
+    let counts = r.step.map { " \($0)/\(r.totalSteps ?? 0)" } ?? ""
+    FileHandle.standardError.write(Data(String(
+        format: "[phase %6.1fs] %@%@\n", Date().timeIntervalSince(t0), r.phase.rawValue, counts).utf8))
+}
+
 let response: any CapabilityResponse
 if surface == "edit" {
     guard let refPath, let refData = FileManager.default.contents(atPath: refPath) else {
@@ -54,17 +72,21 @@ if surface == "edit" {
     let package = try MageFlowEditPackage.registration.makePackage(config)
     try await package.load()
     print("loaded in \(String(format: "%.1f", Date().timeIntervalSince(t0)))s")
-    response = try await package.run(IEditRequest(
-        images: [Image(format: .png, data: refData, width: 0, height: 0)],
-        prompt: "make the background a snowy forest", seed: 42))
+    response = try await RunProgress.$sink.withValue(progressSink) {
+        try await package.run(IEditRequest(
+            images: [Image(format: .png, data: refData, width: 0, height: 0)],
+            prompt: "make the background a snowy forest", seed: 42))
+    }
 } else {
     let config = MageFlowConfiguration(
         variant: .turbo, quant: quant, snapshotPath: root, defaultSize: 512)
     let package = try MageFlowT2IPackage.registration.makePackage(config)
     try await package.load()
     print("loaded in \(String(format: "%.1f", Date().timeIntervalSince(t0)))s")
-    response = try await package.run(T2IRequest(
-        prompt: "a red fox sitting in a snowy forest, photorealistic", seed: 42))
+    response = try await RunProgress.$sink.withValue(progressSink) {
+        try await package.run(T2IRequest(
+            prompt: "a red fox sitting in a snowy forest, photorealistic", seed: 42))
+    }
 }
 
 let image: Image
@@ -78,6 +100,24 @@ default: die("unexpected response type \(type(of: response))")
 let (iw, ih) = (image.width ?? 0, image.height ?? 0)
 guard image.format == .png, iw >= 256, ih >= 256, image.data.count > 10_000
 else { die("SMOKE FAIL: degenerate image \(iw)x\(ih) \(image.data.count)B") }
+
+// V2 progress plane: a silent run is a regression, not a cosmetic gap. Require the
+// per-step denoise counter (the signal consumers actually render) to have covered the
+// whole loop, plus the decode seam that follows it.
+let steps = phases.items.filter { $0.phase == .denoise }.compactMap(\.step)
+let declaredTotal = phases.items.first { $0.phase == .denoise }?.totalSteps ?? 0
+guard !steps.isEmpty, steps == Array(1 ... max(declaredTotal, 1)),
+      phases.items.contains(where: { $0.phase == .decode })
+else {
+    die("SMOKE FAIL: progress plane — denoise steps \(steps) of \(declaredTotal), "
+        + "phases seen \(phases.items.map(\.phase.rawValue))")
+}
 try image.data.write(to: URL(fileURLWithPath: outPath))
 print("SMOKE PASS \(surface) \(quant): \(iw)x\(ih) "
     + "\(image.data.count / 1024) KiB in \(String(format: "%.1f", Date().timeIntervalSince(t0)))s -> \(outPath)")
+// collapse the per-step repeats into the phase sequence a consumer would render
+let phaseTrace = phases.items.map(\.phase.rawValue).reduce(into: [String]()) { acc, p in
+    if acc.last != p { acc.append(p) }
+}
+print("  phases: \(phaseTrace.joined(separator: " → ")) "
+    + "(denoise \(steps.count)/\(declaredTotal) steps reported)")

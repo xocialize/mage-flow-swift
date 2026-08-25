@@ -28,6 +28,23 @@ public enum MageFlowPackageError: Error, LocalizedError {
     }
 }
 
+// MARK: - run-phase progress bridge
+
+/// Forwards the core's ambient phase events into the engine's `RunProgress` plane (contract
+/// 1.18.0, ENGINE-NEEDS V2). The engine binds `RunProgress.sink` as a task-local around
+/// `run()`; the core reports into its own engine-free `MageProgress` sink, and this closure
+/// joins the two. The core's `encode`/`denoise`/`decode` names match the canonical `RunPhase`
+/// constants verbatim, so raw values forward with no mapping table; `screen` forwards under its
+/// own name (consumers tolerate unknown phases by contract).
+///
+/// Namespaced rather than inlined so the offline suite can exercise the mapping without weights.
+enum MageProgressBridge {
+    static let forward: MageProgress.Sink = { e in
+        RunProgress.report(RunPhase(rawValue: e.phase.rawValue),
+                           step: e.step, totalSteps: e.totalSteps)
+    }
+}
+
 // MARK: - shared load/run engine (both packages delegate here)
 
 /// Non-protocol core shared by the two package classes: resolve → load → dispatch.
@@ -98,17 +115,22 @@ final class MageFlowRuntime {
         // The Responsible-AI screen runs unless the caller opted to bypass it.
         let screen = !cfg.bypassContentFilter
         do {
-            let nhwc: MLXArray
-            if let refImage {
-                let (rgb, w, h) = try MageFlowEditPipeline.decodeRGB(data: refImage.data)
-                nhwc = try pipeline.edit(refRGB: rgb, width: w, height: h,
-                                         instruction: prompt, screen: screen,
-                                         shouldStop: { Task.isCancelled })
-            } else {
-                nhwc = try pipeline.t2i(prompt: prompt, screen: screen,
-                                        shouldStop: { Task.isCancelled })
+            // Bind the core's phase sink for exactly this generation; the events land in the
+            // engine's RunProgress plane, whose own sink the engine bound around run().
+            let nhwc: MLXArray = try MageProgress.$sink.withValue(MageProgressBridge.forward) {
+                if let refImage {
+                    let (rgb, w, h) = try MageFlowEditPipeline.decodeRGB(data: refImage.data)
+                    return try pipeline.edit(refRGB: rgb, width: w, height: h,
+                                             instruction: prompt, screen: screen,
+                                             shouldStop: { Task.isCancelled })
+                } else {
+                    return try pipeline.t2i(prompt: prompt, screen: screen,
+                                            shouldStop: { Task.isCancelled })
+                }
             }
             try Task.checkCancellation()
+            // PNG encode is the only work left after the model is done.
+            RunProgress.report(.postprocess)
             let (png, w, h) = try MageFlowEditPipeline.encodePNG(nhwc)
             return Image(format: .png, data: png, width: w, height: h)
         } catch let e as MageFlowEditError {
