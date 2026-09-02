@@ -13,6 +13,11 @@ swift build -c release
   --repo <Mage-Flow-Edit-Turbo snapshot dir> \
   --ref dog.jpg --prompt "make the background a snowy forest" \
   --out edit.png
+
+# multi-reference (1–3 refs, in prompt order: Image 1, Image 2, Image 3)
+.build/release/mage-flow-edit --repo <snapshot dir> \
+  --ref headphones.png --ref marble.png \
+  --prompt "Place the headphones from Image 1 on the marble table from Image 2" --out edit.png
 ```
 
 `<snapshot dir>` is a downloaded `microsoft/Mage-Flow-Edit-*` repo plus a
@@ -28,7 +33,7 @@ PyTorch oracle + a clean render each at real defaults):
 
 | checkpoint | mode | defaults | validation |
 |---|---|---|---|
-| Mage-Flow-Edit-Turbo | edit | 4 / cfg 1.0 | full parity suite + e2e |
+| Mage-Flow-Edit-Turbo | edit | 4 / cfg 1.0 | full parity suite + e2e + **multi-ref (2 & 3 refs) e2e gate** |
 | Mage-Flow-Edit (RL) | edit | 20 / cfg 5.0 | per-step CFG gate 1.3e-2 + render |
 | Mage-Flow-Edit-Base | edit | 30 / cfg 5.0 | render |
 | Mage-Flow (RL) | t2i | 20 / cfg 5.0 | t2i gate 5.5e-2, CFG per-step 2.5e-2 + render |
@@ -55,6 +60,7 @@ validity instead.
 | FlowMatchEuler schedule | exact | Turbo 4-step to the digit |
 | end-to-end 4-step denoise | 2.8e-2 | `E2EGate` (bf16-oracle vs fp32) |
 | **full resolution range 512–2048** | 2048² @ **34.2 dB PSNR** vs oracle | decoded-render gate, every tier eyeballed |
+| **multi-reference edit (2 and 3 refs)** | per-step DiT 1.6e-2 (2-ref) · 1.4e-2 (3-ref) | `E2EGate --edit-refs N` + conditioning cosine + decoded render (see below) |
 
 Qwen3-VL-4B conditioning + the content filter come from
 [qwen3vl-mlx-swift](https://github.com/xocialize/qwen3vl-mlx-swift).
@@ -81,6 +87,48 @@ Qwen3-VL-4B conditioning + the content filter come from
 - **The VAE adaLN fold must be baked, not recomputed** (bf16 fold, one channel
   off by 0.039 → 1.2 error while cosine read 1.00000000).
 - **`sample_posterior` is True at runtime** despite the config saying false.
+
+## Multi-reference edit (1–3 references) — v0.6.0, AB-A-0047
+
+`MageFlowEditPackage` accepts `IEditRequest.images.count ∈ 1…3` (upstream's *trained*
+range; 4+ is rejected legibly, never truncated). References are in prompt order —
+Image 1 is the primary — and the mechanism is upstream's exactly: one
+`Image j: <|vision_start|><|image_pad|><|vision_end|>` placeholder per reference in the
+VL prompt (`_edit_prompt_body`), every reference VAE-encoded at the target size, and
+the latents sequence-concatenated as `[target, ref_1 … ref_N]` with RoPE frame index
+*j* per reference. The content filter screens all references together (`There are N
+source image(s) above.`), at original resolution, fail-closed.
+
+**Gates (Turbo, 512², seed 42, cfg 1.0, PNG fixtures = upstream's `multiref_000000_{0,1}` +
+`dog.jpg`, oracle on CPU via `Weights/capture_multiref.py`):**
+
+| gate | 2 refs | 3 refs |
+|---|---|---|
+| per-step DiT parity, packed `[target, ref…]` (`E2EGate --edit-refs N`, fp32 vs bf16 oracle) | worst rel **1.6e-2** PASS | worst rel **1.4e-2** PASS |
+| Qwen3-VL conditioning cosine vs oracle `txt_norm` input (`MAGEFLOW_DUMP_FEATS`) | 0.971 global (text tokens 0.999) | 0.975 global (text tokens 0.999) |
+| decoded render vs oracle (`goldens/multiref/N/render.png`) | 24.3 dB, same composition | 23.0 dB, same composition |
+| content-filter verdict vs oracle `screen_edit` | pass / pass | refuse / refuse |
+| filter M-RoPE positions vs HF `get_rope_index` (`MAGEFLOW_DUMP_FILTER`) | exact (3348 tokens) | exact (5402 tokens) |
+
+Reading the conditioning number honestly: the same two fixtures encoded **alone**
+score 0.969 / 0.971 on their image tokens, identical to their joint scores, and the
+causal-prefix invariant holds (Image 1's tokens are unchanged when Image 2 follows) —
+so the residual is the pre-existing per-image bf16 vision-path precision of the
+single-ref port on these particular images (the dog fixture scores 0.996), not the
+multi-reference logic. Two findings that fell out of the gate:
+
+- **JPEG decoding, not resizing, was the larger conditioning error.** ImageIO and
+  libjpeg decode the same JPEG differently (max 44 / mean 1.0 levels on the landscape
+  fixture); the PIL-BICUBIC resize path matches PIL to within 2 levels. Feed the port
+  PNGs when parity matters (the ModelSheet consumer already does).
+- Single-ref path is **bit-identical** to v0.5.0 (same seed, same input) — the N loop
+  is a pure generalisation.
+
+Measured peaks (M5 Max, filter on, bf16 DiT unless noted): 2-ref @512² 19.4 GB ·
+3-ref @768² 19.1 GB (int8 DiT 16.8 GB) · 3-ref @1024² 19.8 GB · vs 1-ref @768² 18.9 GB —
+each extra reference adds one clean latent (≈ +2 % at 1024²), well inside the declared
+1024² envelope. 4-step Turbo composes three references without collapsing (the
+consumer's "if Turbo multi-ref turns out weak" question): see the gate renders.
 
 ## Run-phase progress
 

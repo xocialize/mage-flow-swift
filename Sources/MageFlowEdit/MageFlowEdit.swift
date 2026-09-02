@@ -4,15 +4,29 @@
 // with live Qwen3-VL conditioning and the mandatory content filter from
 // qwen3vl-mlx-swift.
 //
-// Pipeline (mirrors upstream `generate_edits`, Turbo path):
-//   1. content filter (AR classifier) — fail-closed, white refusal image
-//   2. prompt template + edit body, tokenize, expand <|image_pad|> per grid
-//   3. Qwen3-VL forward with the ref at 384px long-edge -> last_hidden_state,
+// Pipeline (mirrors upstream `generate_edits`, Turbo path), for 1…3 references:
+//   1. content filter (AR classifier) over ALL refs + instruction — fail-closed
+//   2. prompt template + edit body `Image 1: <ph>Image 2: <ph>…{instruction}`,
+//      tokenize, expand the k-th <|image_pad|> per the k-th ref's grid
+//   3. Qwen3-VL forward with every ref at 384px long-edge -> last_hidden_state,
 //      slice off the first start_idx (64) tokens        [FLAT positionIds]
-//   4. MageVAE-encode the ref at full target resolution -> ref latent
+//   4. MageVAE-encode every ref at the full target resolution -> ref latents
+//      (output size comes from the request; upstream derives it from the FIRST ref)
 //   5. Gaussian-Shading watermarked target noise
-//   6. pack [target, ref], 4-step denoise (target stepped, ref clean)
+//   6. pack [target, ref_1 … ref_N], 4-step denoise (target stepped, refs clean);
+//      the RoPE frame index j is the only thing telling ref_j from the target
 //   7. MageVAE-decode the target -> RGB
+//
+// Multi-reference (AB-A-0047, 2026-09-02): upstream trains with up to 3 refs and
+// the mechanism is exactly the single-ref one with an N loop — extra clean latent
+// tokens in the same attention sequence, disambiguated by frame index + a per-image
+// placeholder in the VL prompt. `pipeline.py:390-393` (placeholders), `:500-518`
+// (all refs VAE-encoded at target size, shape_seq frame idx j per ref).
+//
+// Parity hooks (env, inert otherwise): MAGEFLOW_DUMP_FEATS=<path.npy> saves the
+// conditioning features for a cosine check vs the oracle's txt_norm input;
+// MAGEFLOW_DUMP_FILTER=<dir> saves the filter's ids + spatial M-RoPE positions for
+// a check vs HF get_rope_index (both used by the 2026-09-02 multi-ref gate).
 
 import CoreGraphics
 import Foundation
@@ -25,7 +39,21 @@ import Qwen3VL
 import Tokenizers
 import UniformTypeIdentifiers
 
+/// One reference image, tightly-packed RGB8, row-major — the engine-facing unit.
+public struct MageRefImage: Sendable {
+    public var rgb: [UInt8]
+    public var width: Int
+    public var height: Int
+    public init(rgb: [UInt8], width: Int, height: Int) {
+        self.rgb = rgb; self.width = width; self.height = height
+    }
+}
+
 public struct MageFlowEditConfig {
+    /// Upstream's validated multi-reference range: trained with up to 3 refs
+    /// (`generate_edits` docstring — "trained with up to 3, but more are accepted").
+    /// The port stops at the trained range; beyond it is untested, not unsupported.
+    public static let maxReferences = 3
     public var steps = 4
     public var shift: Float = 6.0
     public var size = 512               // target square side (floored to /16)
@@ -232,23 +260,40 @@ public final class MageFlowEditPipeline {
 
     // MARK: tokenization
 
-    /// Tokenize the formatted prompt and expand each single `<|image_pad|>` into
-    /// `grid.product / mergeSize^2` copies — the HF AutoProcessor contract.
-    func buildInputIds(formatted: String, grid: THW) throws -> [Int32] {
+    /// Tokenize the formatted prompt and expand the k-th single `<|image_pad|>` into
+    /// `grids[k].product / mergeSize^2` copies — the HF AutoProcessor contract, which
+    /// consumes `image_grid_thw` rows in placeholder order.
+    func buildInputIds(formatted: String, grids: [THW]) throws -> [Int32] {
         let merge = imageProcessor.mergeSize * imageProcessor.mergeSize
-        let nImage = grid.product / merge
         let ids = tokenizer.encode(text: formatted)
         let pad = try conditioner().config.imageTokenIndex
         var out: [Int32] = []
-        out.reserveCapacity(ids.count + nImage)
+        out.reserveCapacity(ids.count + grids.reduce(0) { $0 + $1.product / merge })
+        var k = 0
         for id in ids {
             if id == pad {
-                out.append(contentsOf: Array(repeating: Int32(pad), count: nImage))
+                guard k < grids.count else {
+                    throw MageFlowEditError.load("prompt has more <|image_pad|> than images (\(grids.count))")
+                }
+                out.append(contentsOf: Array(repeating: Int32(pad), count: grids[k].product / merge))
+                k += 1
             } else {
                 out.append(Int32(id))
             }
         }
+        guard k == grids.count else {
+            throw MageFlowEditError.load("prompt has \(k) <|image_pad|> for \(grids.count) images")
+        }
         return out
+    }
+
+    func buildInputIds(formatted: String, grid: THW) throws -> [Int32] {
+        try buildInputIds(formatted: formatted, grids: [grid])
+    }
+
+    /// The upstream `_edit_prompt_body`: `Image 1: <ph>Image 2: <ph>…{instruction}`.
+    static func editPromptBody(instruction: String, refCount: Int) -> String {
+        (1 ... max(refCount, 1)).map { "Image \($0): \(visionPlaceholder)" }.joined() + instruction
     }
 
     // MARK: text-only conditioning (T2I)
@@ -322,59 +367,115 @@ public final class MageFlowEditPipeline {
     /// content filter; on refusal throws `.refused`.
     public func edit(refImage: URL, instruction: String, screen: Bool = true,
                      shouldStop: (() -> Bool)? = nil) throws -> MLXArray {
-        let (rgb, iw, ih) = try Self.decodeRGB(refImage)
-        return try edit(refRGB: rgb, width: iw, height: ih, instruction: instruction,
-                        screen: screen, shouldStop: shouldStop)
+        try edit(refImages: [refImage], instruction: instruction, screen: screen, shouldStop: shouldStop)
+    }
+
+    /// File entry for 1…`maxReferences` references, in prompt order (Image 1, Image 2, …).
+    public func edit(refImages: [URL], instruction: String, screen: Bool = true,
+                     shouldStop: (() -> Bool)? = nil) throws -> MLXArray {
+        let refs = try refImages.map { url -> MageRefImage in
+            let (rgb, w, h) = try Self.decodeRGB(url)
+            return MageRefImage(rgb: rgb, width: w, height: h)
+        }
+        return try edit(refs: refs, instruction: instruction, screen: screen, shouldStop: shouldStop)
     }
 
     /// Bytes entry (engine surface): `refRGB` is tightly-packed RGB8, row-major.
     public func edit(refRGB rgb: [UInt8], width iw: Int, height ih: Int,
                      instruction: String, screen: Bool = true,
                      shouldStop: (() -> Bool)? = nil) throws -> MLXArray {
-        let side = (cfg.size / 16) * 16
+        try edit(refs: [MageRefImage(rgb: rgb, width: iw, height: ih)], instruction: instruction,
+                 screen: screen, shouldStop: shouldStop)
+    }
 
-        // --- VL conditioning image at 384px long edge ---------------------
+    /// The general entry: 1…`MageFlowEditConfig.maxReferences` references in prompt
+    /// order. Ref 1 is the PRIMARY reference (upstream derives the output size from
+    /// it; here the caller's `cfg.size` is authoritative and every ref is VAE-encoded
+    /// at that size, exactly as upstream does once the size is fixed).
+    public func edit(refs: [MageRefImage], instruction: String, screen: Bool = true,
+                     shouldStop: (() -> Bool)? = nil) throws -> MLXArray {
+        guard !refs.isEmpty else { throw MageFlowEditError.load("edit needs at least one reference image") }
+        guard refs.count <= MageFlowEditConfig.maxReferences else {
+            throw MageFlowEditError.load(
+                "\(refs.count) reference images — the trained/validated range is 1…\(MageFlowEditConfig.maxReferences)")
+        }
+        let side = (cfg.size / 16) * 16
+        let n = refs.count
+
+        // --- VL conditioning images at 384px long edge --------------------
         // Must be PIL BICUBIC, and preprocess() then PIL-resizes AGAIN internally
         // (two-BICUBIC path, exactly as the oracle's _resize_long_edge + processor
         // smart_resize). CoreGraphics resampling here corrupts the resampling-
         // sensitive ViT features (cos 0.93 -> garbage edit).
-        let longEdge = max(iw, ih)
-        let (vw, vh): (Int, Int)
-        if longEdge > cfg.vlCondLongEdge {
-            let scale = Double(cfg.vlCondLongEdge) / Double(longEdge)
-            vw = max(1, Int((Double(iw) * scale).rounded()))
-            vh = max(1, Int((Double(ih) * scale).rounded()))
-        } else {
-            (vw, vh) = (iw, ih)
+        // Multi-image: the processor concatenates every image's patches along axis 0
+        // and carries one grid row per image — the vision tower isolates images by
+        // cu_seqlens and the LM scatters features into the placeholders in order.
+        var condPixels: [MLXArray] = []
+        var condGrids: [THW] = []
+        for r in refs {
+            let longEdge = max(r.width, r.height)
+            let (vw, vh): (Int, Int)
+            if longEdge > cfg.vlCondLongEdge {
+                let scale = Double(cfg.vlCondLongEdge) / Double(longEdge)
+                vw = max(1, Int((Double(r.width) * scale).rounded()))
+                vh = max(1, Int((Double(r.height) * scale).rounded()))
+            } else {
+                (vw, vh) = (r.width, r.height)
+            }
+            let vlRGB = PILResize.resize(rgb: r.rgb, width: r.width, height: r.height,
+                                         outWidth: vw, outHeight: vh)
+            let (pv, grid) = imageProcessor.preprocess(rgb: vlRGB, width: vw, height: vh)
+            condPixels.append(pv)
+            condGrids.append(grid)
         }
-        let vlRGB = PILResize.resize(rgb: rgb, width: iw, height: ih, outWidth: vw, outHeight: vh)
-        let (pixelValues, grid) = imageProcessor.preprocess(rgb: vlRGB, width: vw, height: vh)
+        let pixelValues = condPixels.count == 1 ? condPixels[0] : concatenated(condPixels, axis: 0)
 
         // --- content filter (mandatory, fail-closed) ----------------------
         // Mirrors upstream screen_edit: real CONTENT_FILTER_EDIT_SYSTEM, the
         // exact user message, greedy generate, JSON verdict. The filter uses REAL
         // spatial M-RoPE (no flat override) — only the conditioning path is flat.
-        // ⚠ The filter sees the ORIGINAL-resolution image (upstream pipeline.py
+        // ⚠ The filter sees the ORIGINAL-resolution images (upstream pipeline.py
         // screens BEFORE the 384px _resize_long_edge, which is conditioning-only).
         // Reusing the 384px conditioning grid here changed the vision-token grid
         // enough to flip borderline verdicts (found live: a benign anime-style
         // edit refused with a self-contradictory rambling reason; upstream torch
         // passes the same input cleanly).
+        // Multi-image: the chat template renders one placeholder per image, back to
+        // back, then the text — "There are N source image(s) above." (screen_edit).
         if screen {
             MageProgress.report(.screen)
-            let (filterPixels, filterGrid) = imageProcessor.preprocess(rgb: rgb, width: iw, height: ih)
+            var fPixels: [MLXArray] = []
+            var fGrids: [THW] = []
+            for r in refs {
+                let (pv, g) = imageProcessor.preprocess(rgb: r.rgb, width: r.width, height: r.height)
+                fPixels.append(pv); fGrids.append(g)
+            }
+            let filterPixels = fPixels.count == 1 ? fPixels[0] : concatenated(fPixels, axis: 0)
             let instr = instruction.trimmingCharacters(in: .whitespacesAndNewlines)
-            let userText = "There is 1 source image(s) above. Edit instruction: "
+            let userText = "There \(n == 1 ? "is" : "are") \(n) source image(s) above. Edit instruction: "
                 + (instr.isEmpty ? "(no textual instruction)" : instr)
                 + "\nClassify this edit request."
             let filterPrompt =
                 "<|im_start|>system\n\(contentFilterEditSystem)<|im_end|>\n"
-                + "<|im_start|>user\n\(visionPlaceholder)\(userText)<|im_end|>\n"
+                + "<|im_start|>user\n\(String(repeating: visionPlaceholder, count: n))\(userText)<|im_end|>\n"
                 + "<|im_start|>assistant\n"
-            let fids = try buildInputIds(formatted: filterPrompt, grid: filterGrid)
+            let fids = try buildInputIds(formatted: filterPrompt, grids: fGrids)
+            // Parity hook: MAGEFLOW_DUMP_FILTER=<dir> saves the filter's input ids and the
+            // spatial M-RoPE positions the LM will use, for a check against HF get_rope_index.
+            if let dumpDir = ProcessInfo.processInfo.environment["MAGEFLOW_DUMP_FILTER"] {
+                let d = URL(fileURLWithPath: dumpDir)
+                try FileManager.default.createDirectory(at: d, withIntermediateDirectories: true)
+                let dbg = try conditioner().debugEdit(
+                    inputIds: MLXArray(fids, [1, fids.count]), pixelValues: filterPixels, imageGridTHW: fGrids)
+                try MLX.save(array: MLXArray(fids, [1, fids.count]), url: d.appendingPathComponent("ids.npy"))
+                try MLX.save(array: dbg.positionIds, url: d.appendingPathComponent("pos.npy"))
+                try MLX.save(array: dbg.merged.asType(.float32), url: d.appendingPathComponent("merged.npy"))
+                let grids = fGrids.map { "\($0.t),\($0.h),\($0.w)" }.joined(separator: ";")
+                try grids.write(to: d.appendingPathComponent("grids.txt"), atomically: true, encoding: .utf8)
+            }
             let verdictTokens = try conditioner().generate(
                 inputIds: MLXArray(fids, [1, fids.count]),
-                pixelValues: filterPixels, imageGridTHW: [filterGrid], maxTokens: 192)
+                pixelValues: filterPixels, imageGridTHW: fGrids, maxTokens: 192)
             let verdict = tokenizer.decode(tokens: verdictTokens.map { Int($0) })
                 .replacingOccurrences(of: " ", with: "")
             if verdict.lowercased().contains("\"violates\":true") {
@@ -386,13 +487,13 @@ public final class MageFlowEditPipeline {
         // --- conditioning features ----------------------------------------
         // Mage-Flow feeds FLAT positions — M-RoPE degenerates to 1-D.
         func encodeEdit(_ instr: String) throws -> MLXArray {
-            let body = "Image 1: \(visionPlaceholder)\(instr)"
+            let body = Self.editPromptBody(instruction: instr, refCount: n)
             let formatted = mageFlowEditTemplate.replacingOccurrences(of: "{}", with: body)
-            let ids = try buildInputIds(formatted: formatted, grid: grid)
+            let ids = try buildInputIds(formatted: formatted, grids: condGrids)
             let flat = Qwen3VL.flatPositionIds(sequenceLength: ids.count)
             var f = try conditioner().lastHiddenState(
                 inputIds: MLXArray(ids, [1, ids.count]), pixelValues: pixelValues,
-                imageGridTHW: [grid], positionIds: flat)
+                imageGridTHW: condGrids, positionIds: flat)
             // slice off the first start_idx tokens (system preamble)
             f = f[0..., cfg.startIdx..., 0...].asType(.float32)
             eval(f)
@@ -400,19 +501,28 @@ public final class MageFlowEditPipeline {
         }
         MageProgress.report(.encode)
         let feats = try encodeEdit(instruction)
-        // CFG (Base/RL): negative pass encodes the SAME ref image with the
+        // Parity hook: MAGEFLOW_DUMP_FEATS=<path.npy> saves the conditioning features
+        // (post start_idx slice) for a cosine check against the oracle's txt_norm input.
+        if let dump = ProcessInfo.processInfo.environment["MAGEFLOW_DUMP_FEATS"] {
+            try MLX.save(array: feats, url: URL(fileURLWithPath: dump))
+        }
+        // CFG (Base/RL): negative pass encodes the SAME ref images with the
         // negative instruction (upstream: edit_refs + edit_refs, pos + neg).
         let useCFG = cfg.cfg > 1.0 && !cfg.negPrompt.isEmpty
         let negFeats = useCFG ? try encodeEdit(cfg.negPrompt) : nil
 
-        // --- ref latent (full target resolution) --------------------------
-        let refPx = Self.resize(rgb, iw, ih, side, side)
-        var arr = [Float](repeating: 0, count: side * side * 3)
-        for i in 0 ..< side * side * 3 { arr[i] = Float(refPx[i]) / 127.5 - 1 }
-        let refImg = MLXArray(arr, [1, side, side, 3])
-        let refLatent = vaeEncode(refImg, vae, samplePosterior: false)
-        eval(refLatent)
-        let (lh, lw) = (refLatent.dim(1), refLatent.dim(2))
+        // --- ref latents (every ref at the full target resolution) --------
+        var refLatents: [MLXArray] = []
+        for r in refs {
+            let refPx = Self.resize(r.rgb, r.width, r.height, side, side)
+            var arr = [Float](repeating: 0, count: side * side * 3)
+            for i in 0 ..< side * side * 3 { arr[i] = Float(refPx[i]) / 127.5 - 1 }
+            let refImg = MLXArray(arr, [1, side, side, 3])
+            let lat = vaeEncode(refImg, vae, samplePosterior: false)
+            eval(lat)
+            refLatents.append(lat)
+        }
+        let (lh, lw) = (refLatents[0].dim(1), refLatents[0].dim(2))
 
         // --- Gaussian-Shading target noise --------------------------------
         let noise = gaussianShadingNoise(
@@ -420,9 +530,12 @@ public final class MageFlowEditPipeline {
         let target = MLXArray(noise, [1, 128, lh, lw]).transposed(0, 2, 3, 1)
 
         // --- pack + denoise -----------------------------------------------
-        let packed = concatenated([target.reshaped(1, lh * lw, 128),
-                                   refLatent.reshaped(1, lh * lw, 128)], axis: 1).asType(ditDtype)
-        let shapes = [(frame: 1, height: lh, width: lw), (frame: 1, height: lh, width: lw)]
+        // [target, ref_1 … ref_N]; one shape entry per member — the enumeration
+        // index IS the RoPE frame axis (target 0, ref_j = j).
+        let packed = concatenated(
+            [target.reshaped(1, lh * lw, 128)] + refLatents.map { $0.reshaped(1, lh * lw, 128) },
+            axis: 1).asType(ditDtype)
+        let shapes = Array(repeating: (frame: 1, height: lh, width: lw), count: n + 1)
         let sched = FlowMatchEulerScheduler(steps: cfg.steps, shift: cfg.shift)
         let pipe = MageFlowPipeline(transformer: transformer)
         let out = pipe.denoise(img: packed, txt: feats.asType(ditDtype),

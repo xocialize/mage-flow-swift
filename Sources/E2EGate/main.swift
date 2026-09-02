@@ -45,22 +45,32 @@ let pipe = MageFlowPipeline(transformer: model)
 // Gate B (--t2i-b): + CFG (cfg=5.0, two forwards/step, batch_cfg=False):
 //   img_in fires twice per step (cond, unc — identical), txt alternates pos/neg;
 //   start = img_in_00, pos = txt_00, neg = txt_01, compare to img_in_{2(k+1)}.
-if let mode = args.first(where: { $0 == "--t2i-a" || $0 == "--t2i-b" || $0 == "--edit-cfg" }) {
-    let isCFG = mode != "--t2i-a"
-    let isEdit = mode == "--edit-cfg"
+// Gate M (--edit-refs N): multi-reference Turbo edit (cfg=1.0, AB-A-0047) —
+//   packed [target, ref_1 … ref_N] (N+1 equal squares), N+1 shape entries so the
+//   RoPE frame axis runs 0…N; goldens from capture_multiref.py (img_in_XX + txt_00).
+//   Same per-step-reset protocol as Gate A. This is the DiT-side gate for the
+//   multi-frame RoPE path; the VL multi-image conditioning is gated separately
+//   (MAGEFLOW_DUMP_FEATS cosine vs txt_00) and end-to-end by the decoded render.
+let editRefs: Int? = args.firstIndex(of: "--edit-refs").flatMap { i in
+    i + 1 < args.count ? Int(args[i + 1]) : nil
+}
+if let mode = args.first(where: { $0 == "--t2i-a" || $0 == "--t2i-b" || $0 == "--edit-cfg" })
+    ?? (editRefs != nil ? "--edit-refs" : nil) {
+    let isCFG = mode == "--t2i-b" || mode == "--edit-cfg"
+    let nRefs = mode == "--edit-cfg" ? 1 : (editRefs ?? 0)
+    let isEdit = nRefs > 0
     // inputs must be gateDtype too — fp32 inputs x bf16 weights type-promote
     // back to fp32 compute, silently undoing --bf16
     let img0 = try npy("\(dir)/img_in_00.npy").asType(gateDtype)
     let txtPos = try npy("\(dir)/txt_00.npy").asType(gateDtype)
     let txtNeg = isCFG ? try npy("\(dir)/txt_01.npy").asType(gateDtype) : nil
     let L = img0.dim(1)
-    // edit: packed [target, ref], each side^2; t2i: whole sequence is the target
-    let targetLen = isEdit ? L / 2 : L
+    // edit: packed [target, ref_1…ref_N], each side^2; t2i: whole sequence is the target
+    let targetLen = isEdit ? L / (nRefs + 1) : L
     let side = Int(Double(targetLen).squareRoot())
-    let shapes = isEdit
-        ? [(frame: 1, height: side, width: side), (frame: 1, height: side, width: side)]
-        : [(frame: 1, height: side, width: side)]
-    err("[t2i] \(mode) packed \(img0.shape) grid \(side)x\(side)")
+    guard side * side == targetLen else { err("non-square target \(targetLen) tokens for \(nRefs) refs"); exit(2) }
+    let shapes = Array(repeating: (frame: 1, height: side, width: side), count: nRefs + 1)
+    err("[t2i] \(mode) refs=\(nRefs) packed \(img0.shape) grid \(side)x\(side)")
 
     final class W2: @unchecked Sendable { var worst: Float = 0 }
     let acc2 = W2()

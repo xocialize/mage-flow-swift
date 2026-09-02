@@ -882,3 +882,37 @@ model's native 4×-base behaviour, not a port artifact. Range summary: 512² pix
 (earlier gate), 768²/1024²/1536² oracle renders coherent, 2048² at 34.2 dB. The full
 512–2048 claim on the cards is now evidence-backed. Remaining Mage-Flow item: delete the
 row-chunk when an mlx-swift release vendors mlx ≥ #3810 (probe first).
+
+## Multi-reference edit (1–3 refs) — v0.6.0, 2026-09-02 (AB-A-0047)
+
+Upstream's mechanism (`pipeline.py:390-393`, `:500-518`) is the single-ref one with an
+N loop: `Image j: <ph>` placeholders in the VL prompt, every ref VAE-encoded at the
+target size, latents packed `[target, ref_1 … ref_N]`, shape_seq entry per ref so the
+RoPE frame axis runs 0…N. The DiT/RoPE side already generalised (`imgShapes` is one
+flat run; frame index = enumeration index), so the port change is confined to
+`MageFlowEdit.edit(refs:)` (N-image VL conditioning + filter, N ref latents) and the
+wrapper guard (`1…MageFlowEditConfig.maxReferences`).
+
+Gate (Turbo 512², seed 42, oracle CPU bf16 via `Weights/capture_multiref.py`, goldens in
+`mage-flow-oracle/goldens/multiref/{2,3}/`): `E2EGate --edit-refs 2` worst rel 1.6e-2
+PASS; conditioning cosine 0.971 (text tokens 0.999); render 24.3 dB same composition;
+filter verdicts match the oracle on both cases (2-ref pass, 3-ref refused by BOTH —
+oracle category `policy`, port `copyright`, same fail-closed outcome); the port's spatial
+M-RoPE positions for 2 and 3 images equal HF `get_rope_index` exactly. 3-ref: `E2EGate --edit-refs 3` worst rel 1.4e-2 PASS; conditioning cosine 0.975; render 23.0 dB, same composition (dog from Image 3 wearing the headphones from Image 1 on Image 2's table).
+
+Two traps met on the way, recorded so nobody re-derives them:
+
+1. **A stale product binary looked like a multi-ref bug.** With the swiftbuild build
+   system, `swift build -c release --product A --product B --product C` reported
+   "Build complete" in ~1–20 s WITHOUT recompiling or relinking; single-`--product`
+   invocations rebuilt correctly. The stale CLI kept only the LAST `--ref`, so the
+   "2-ref" render was a single-ref edit of the last image and the filter's "Image 1 is
+   not provided" refusal was CORRECT for what it saw. Verify a rebuilt binary by
+   behaviour (a rejected 4-ref call, a dump hook that writes a file) before reading any
+   parity number off it. Build products one `--product` at a time.
+2. **JPEG decode is a bigger conditioning-parity term than the resize.** ImageIO vs
+   libjpeg differ by up to 44 levels (mean ~1.0) on `multiref_000000_0.jpg`; the
+   PIL-BICUBIC resize matches to ≤2 levels. Solo-vs-joint per-image cosines are
+   identical (0.969 / 0.971) and the causal-prefix invariant holds, so the residual is
+   the single-image bf16 vision path on those fixtures, not the N-image code. Gate on
+   PNG fixtures.

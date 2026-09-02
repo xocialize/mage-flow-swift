@@ -90,9 +90,10 @@ final class MageFlowRuntime {
     /// Apply per-request canonical overrides, run one generation, encode PNG.
     /// CancellationError from the pipeline seams propagates UNCHANGED; the
     /// upstream filter's refusal is re-thrown as a legible package error.
+    /// `refImages` empty ⇒ t2i; 1…`MageFlowEditConfig.maxReferences` ⇒ edit, in prompt order.
     func generate(
         prompt: String, negativePrompt: String?, width: Int?, steps: Int?,
-        guidance: Double?, seed: UInt64?, refImage: Image?
+        guidance: Double?, seed: UInt64?, refImages: [Image]
     ) async throws -> Image {
         guard let pipeline else { throw PackageError.notLoaded }
         let cfg = configuration
@@ -105,7 +106,7 @@ final class MageFlowRuntime {
         if let negativePrompt, !negativePrompt.isEmpty { pipeline.cfg.negPrompt = negativePrompt }
 
         let prof = MLXProfiler.shared
-        prof.beginRun("mage-flow \(refImage == nil ? "t2i" : "edit") \(cfg.variant.rawValue) "
+        prof.beginRun("mage-flow \(refImages.isEmpty ? "t2i" : "edit×\(refImages.count)") \(cfg.variant.rawValue) "
             + "q=\(cfg.quant) steps=\(pipeline.cfg.steps) g=\(pipeline.cfg.cfg) "
             + "\(pipeline.cfg.size)² evict=\(cfg.evictConditioner)")
         defer {
@@ -118,10 +119,12 @@ final class MageFlowRuntime {
             // Bind the core's phase sink for exactly this generation; the events land in the
             // engine's RunProgress plane, whose own sink the engine bound around run().
             let nhwc: MLXArray = try MageProgress.$sink.withValue(MageProgressBridge.forward) {
-                if let refImage {
-                    let (rgb, w, h) = try MageFlowEditPipeline.decodeRGB(data: refImage.data)
-                    return try pipeline.edit(refRGB: rgb, width: w, height: h,
-                                             instruction: prompt, screen: screen,
+                if !refImages.isEmpty {
+                    let refs = try refImages.map { image -> MageRefImage in
+                        let (rgb, w, h) = try MageFlowEditPipeline.decodeRGB(data: image.data)
+                        return MageRefImage(rgb: rgb, width: w, height: h)
+                    }
+                    return try pipeline.edit(refs: refs, instruction: prompt, screen: screen,
                                              shouldStop: { Task.isCancelled })
                 } else {
                     return try pipeline.t2i(prompt: prompt, screen: screen,
@@ -226,7 +229,7 @@ public final class MageFlowT2IPackage: ModelPackage {
         }
         let image = try await runtime.generate(
             prompt: t2i.prompt, negativePrompt: t2i.negativePrompt, width: t2i.width ?? t2i.height,
-            steps: t2i.steps, guidance: t2i.guidanceScale, seed: t2i.seed, refImage: nil)
+            steps: t2i.steps, guidance: t2i.guidanceScale, seed: t2i.seed, refImages: [])
         return T2IResponse(image: image)
     }
 }
@@ -252,8 +255,9 @@ public final class MageFlowEditPackage: ModelPackage {
                     name: "mage-flow-edit",
                     summary: "Mage-Flow-Edit 4.1B instruction-based image editing (MIT): "
                         + "native-resolution NR-MMDiT with sequence-concat reference "
-                        + "conditioning (ref latent held clean, target denoised), Qwen3-VL-4B "
-                        + "vision conditioning. Single reference image; square 512–2048. Tiers "
+                        + "conditioning (ref latents held clean, target denoised), Qwen3-VL-4B "
+                        + "vision conditioning. 1–3 reference images in prompt order (Image 1 = "
+                        + "primary; the trained range); square 512–2048. Tiers "
                         + "via configuration: RL (20/5), Base (30/5), Turbo (4 steps, ~2.4 s "
                         + "@512²). Mandatory fail-closed content filter + Gaussian-Shading "
                         + "watermark.",
@@ -284,14 +288,16 @@ public final class MageFlowEditPackage: ModelPackage {
         guard let edit = request as? IEditRequest else {
             throw PackageError.unsupportedCapability(request.capability)
         }
-        guard let ref = edit.images.first else {
-            throw PackageError.unsupportedRequestFeature("imageEdit requires one reference image")
+        guard !edit.images.isEmpty else {
+            throw PackageError.unsupportedRequestFeature("imageEdit requires at least one reference image")
         }
-        // The port's validated path is single-reference (upstream supports N refs;
-        // multi-ref is a follow-on) — reject legibly rather than silently dropping refs.
-        guard edit.images.count == 1 else {
+        // 1…3 references in prompt order (Image 1 = primary) — upstream's TRAINED range
+        // (AB-A-0047, multi-ref landed 2026-09-02). Beyond 3 is untested territory upstream
+        // too ("trained with up to 3, but more are accepted"): reject legibly rather than
+        // silently truncating the caller's reference stack.
+        guard edit.images.count <= MageFlowEditConfig.maxReferences else {
             throw PackageError.unsupportedRequestFeature(
-                "multiple reference images (\(edit.images.count)) — single-ref only in this port")
+                "\(edit.images.count) reference images — Mage-Flow-Edit's trained range is 1…\(MageFlowEditConfig.maxReferences)")
         }
         if let w = edit.width, let h = edit.height, w != h {
             throw PackageError.unsupportedRequestFeature(
@@ -300,7 +306,7 @@ public final class MageFlowEditPackage: ModelPackage {
         let image = try await runtime.generate(
             prompt: edit.prompt, negativePrompt: edit.negativePrompt,
             width: edit.width ?? edit.height, steps: edit.steps,
-            guidance: edit.guidanceScale, seed: edit.seed, refImage: ref)
+            guidance: edit.guidanceScale, seed: edit.seed, refImages: edit.images)
         return IEditResponse(image: image)
     }
 }

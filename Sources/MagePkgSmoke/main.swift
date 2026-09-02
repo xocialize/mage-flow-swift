@@ -63,9 +63,17 @@ let progressSink: RunProgress.Sink = { r in
 
 let response: any CapabilityResponse
 if surface == "edit" {
-    guard let refPath, let refData = FileManager.default.contents(atPath: refPath) else {
-        die("edit needs a readable ref image")
+    // ref.png may be a comma-separated list (up to 3) — the multi-reference wrapper path
+    // (AB-A-0047): images land in IEditRequest.images in prompt order.
+    let refPaths = (refPath ?? "").split(separator: ",").map(String.init)
+    let refDatas = refPaths.compactMap { FileManager.default.contents(atPath: $0) }
+    guard !refPaths.isEmpty, refDatas.count == refPaths.count else {
+        die("edit needs readable ref image(s): \(refPaths)")
     }
+    let refImages = refDatas.map { Image(format: .png, data: $0, width: 0, height: 0) }
+    let editPrompt = refImages.count > 1
+        ? "Place the object from Image 1 into the scene of Image 2"
+        : "make the background a snowy forest"
     let config = MageFlowConfiguration(
         variant: .editTurbo, quant: quant, snapshotPath: root, defaultSize: 512)
     // Engine-shaped construction: registration factory (C13), not direct init.
@@ -73,9 +81,7 @@ if surface == "edit" {
     try await package.load()
     print("loaded in \(String(format: "%.1f", Date().timeIntervalSince(t0)))s")
     response = try await RunProgress.$sink.withValue(progressSink) {
-        try await package.run(IEditRequest(
-            images: [Image(format: .png, data: refData, width: 0, height: 0)],
-            prompt: "make the background a snowy forest", seed: 42))
+        try await package.run(IEditRequest(images: refImages, prompt: editPrompt, seed: 42))
     }
 } else {
     let config = MageFlowConfiguration(
