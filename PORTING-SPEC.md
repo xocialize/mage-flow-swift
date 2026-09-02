@@ -916,3 +916,21 @@ Two traps met on the way, recorded so nobody re-derives them:
    identical (0.969 / 0.971) and the causal-prefix invariant holds, so the residual is
    the single-image bf16 vision path on those fixtures, not the N-image code. Gate on
    PNG fixtures.
+
+## Runtime DiT-LoRA — v0.7.0, 2026-09-02 (AB-A-0050)
+
+`MageFlowEdit/LoRA.swift` (`MageLoRA`): klein's `KleinLoRA` minus the fused-qkv split, Mage-typed.
+Activation-path adapter (`LoRALinear.from` → `QLoRALinear` on a `QuantizedLinear` base), scale
+1.0 in the layer with `strength · alpha/rank` baked into `lora_b` (exact; lets adapters
+rank-stack as a sum). Key dialect = ai-toolkit comfy prefix + diffusers module names; the same
+`net.0.proj → proj_in` / `net.2 → proj_out` / `img_mod.1 → img_mod` renames `sanitize` does for
+base weights; `attn.to_out.0` addresses the port's `[Linear]`. Unknown keys THROW with the key
+list (a skipped key = a silent partial adapter). Config: `loraPath`/`loraStrength` runtime-only
+(not persisted, nil on decode), applied in `MageFlowRuntime.load()` after the DiT is resident.
+
+Gates: `mage-lora-smoke synth` — 144 `LoRALinear` on bf16; 132 `QLoRALinear` + 12 `LoRALinear`
+on in-memory int8 (`keepHiBlocks [11]`); unknown-key adapter rejected by name. Live inertness
+pair (2-ref Turbo 512², seed 42): zero-B adapter ⇒ bit-identical to no-LoRA on bf16 AND int8;
+random-B adapter ⇒ max 255 / mean ~21 change — the term is provably live on both tiers.
+Synthetic rank-32 adapter = 85 MB fp16, matching the trainer's expected artifact size.
+First live test = the pod's 250-step checkpoint via `mage-lora-smoke apply <ckpt> [int8]`.

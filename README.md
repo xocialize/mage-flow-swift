@@ -18,6 +18,11 @@ swift build -c release
 .build/release/mage-flow-edit --repo <snapshot dir> \
   --ref headphones.png --ref marble.png \
   --prompt "Place the headphones from Image 1 on the marble table from Image 2" --out edit.png
+
+# runtime DiT-LoRA (activation-path adapter; works on the int8/int4 tiers too)
+.build/release/mage-flow-edit --repo <snapshot dir> --ref skeleton.png --ref identity.png \
+  --lora refcontrol-pose.safetensors --lora-strength 1.0 \
+  --prompt "refcontrol apply pose from image 1 with reference from image 2" --out cell.png
 ```
 
 `<snapshot dir>` is a downloaded `microsoft/Mage-Flow-Edit-*` repo plus a
@@ -61,6 +66,7 @@ validity instead.
 | end-to-end 4-step denoise | 2.8e-2 | `E2EGate` (bf16-oracle vs fp32) |
 | **full resolution range 512–2048** | 2048² @ **34.2 dB PSNR** vs oracle | decoded-render gate, every tier eyeballed |
 | **multi-reference edit (2 and 3 refs)** | per-step DiT 1.6e-2 (2-ref) · 1.4e-2 (3-ref) | `E2EGate --edit-refs N` + conditioning cosine + decoded render (see below) |
+| **runtime DiT-LoRA** | zero-delta adapter bit-identical (bf16 + int8); 144/144 targets | `mage-lora-smoke synth` + CLI inertness pair (see below) |
 
 Qwen3-VL-4B conditioning + the content filter come from
 [qwen3vl-mlx-swift](https://github.com/xocialize/qwen3vl-mlx-swift).
@@ -129,6 +135,39 @@ Measured peaks (M5 Max, filter on, bf16 DiT unless noted): 2-ref @512² 19.4 GB 
 each extra reference adds one clean latent (≈ +2 % at 1024²), well inside the declared
 1024² envelope. 4-step Turbo composes three references without collapsing (the
 consumer's "if Turbo multi-ref turns out weak" question): see the gate renders.
+
+## Runtime DiT-LoRA (1…N adapters) — v0.7.0, AB-A-0050
+
+`MageFlowConfiguration.loraPath` (+ `loraStrength`, default 1.0) applies a local safetensors
+adapter to the resident DiT in `load()`, as an **activation-path** term (`LoRALinear` /
+`QLoRALinear` from MLXLMCommon — never fused into the base, so it survives bf16 AND the
+int8/int4 tiers). It is a runtime override like klein's: not persisted, nil on decode. On the
+CLI: `--lora <adapter> [--lora <second> …] [--lora-strength s]` — several adapters rank-stack
+into one term per module (their exact sum). First consumer: LTX Studio's RefControl **pose**
+LoRA (ai-toolkit `mageflow_edit`, rank 32 / alpha 32, base Mage-Flow-Edit-Base) — a pose cell
+is a two-reference edit, hence the pairing with the multi-ref work above.
+
+**Key dialect** (ai-toolkit comfy prefix, diffusers module names): `diffusion_model.
+transformer_blocks.<i>.attn.{to_q,to_k,to_v,add_q_proj,add_k_proj,add_v_proj,to_out.0,
+to_add_out}` and `…{img_mlp,txt_mlp}.{net.0.proj,net.2}` `.lora_{A,B}.weight` → 144 modules /
+288 tensors (~85 MB fp16 at rank 32). `img_mod.1` / `txt_mod.1` are accepted if present; the
+`transformer.` and `base_model.model.` prefixes too. **Any other key is an error naming the
+keys** — a partially-landing adapter would otherwise be a silent no-op.
+
+**Gates** (`mage-lora-smoke synth <dir>` writes the synthetic adapters, then the CLI):
+
+| gate | result |
+|---|---|
+| structural, bf16 DiT: synthetic rank-32 adapter with the trainer's key set | 144 `LoRALinear`, zero unused keys |
+| structural, int8 DiT (in-memory `MageQuantConfig.int8`, `keepHiBlocks [11]`) | 132 `QLoRALinear` + 12 `LoRALinear` — both dispatch branches |
+| unknown key (`attn.to_qkv`, klein's fused dialect) | rejected loudly, key named |
+| **inertness**, real weights, 2-ref Turbo edit, seed-locked: zero-B adapter vs no LoRA | **bit-identical** on bf16 AND int8 |
+| non-inertness (the gate's complement, AB-L-0026): random-B adapter vs no LoRA | max 255 / mean 21.8 (bf16), 254 / 20.8 (int8) — the term is live |
+| wrapper path (`MAGE_LORA_PATH=… mage-pkg-smoke … edit`) | applied in `load()`, render valid |
+
+The first real checkpoint (the pod's 250-step save) is the live applicator test:
+`mage-lora-smoke apply <ckpt.safetensors> [int8]` prints the landed-target summary and flags a
+count ≠ 144. No licence-clean community Mage LoRA exists yet to gate against.
 
 ## Run-phase progress
 

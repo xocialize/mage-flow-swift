@@ -77,6 +77,12 @@ public struct MageFlowConfiguration: PackageConfiguration, ModelStorable, QuantC
     /// `--no-filter`). Default false — the fail-closed screen runs. When true the
     /// `screen` step is skipped entirely; intended for local development/testing.
     public var bypassContentFilter: Bool
+    /// Runtime DiT-LoRA (AB-A-0050): a local safetensors adapter applied in `load()` after the
+    /// DiT is resident, as an activation-path term (survives bf16 AND the int8/int4 tiers).
+    /// A runtime override like klein's — env-specific, NOT persisted (nil on decode).
+    public var loraPath: String?
+    /// Multiplier on the adapter's own alpha/rank scale (1.0 = diffusers `load_lora_weights`).
+    public var loraStrength: Float
     public var modelsRootDirectory: URL?
 
     public init(
@@ -88,6 +94,8 @@ public struct MageFlowConfiguration: PackageConfiguration, ModelStorable, QuantC
         defaultSize: Int = 1024,
         evictConditioner: Bool = false,
         bypassContentFilter: Bool = false,
+        loraPath: String? = nil,
+        loraStrength: Float = 1.0,
         modelsRootDirectory: URL? = nil
     ) {
         self.variant = variant
@@ -98,6 +106,8 @@ public struct MageFlowConfiguration: PackageConfiguration, ModelStorable, QuantC
         self.defaultSize = defaultSize
         self.evictConditioner = evictConditioner
         self.bypassContentFilter = bypassContentFilter
+        self.loraPath = loraPath
+        self.loraStrength = loraStrength
         self.modelsRootDirectory = modelsRootDirectory
     }
 
@@ -116,6 +126,8 @@ public struct MageFlowConfiguration: PackageConfiguration, ModelStorable, QuantC
         defaultSize = try c.decodeIfPresent(Int.self, forKey: .defaultSize) ?? 1024
         evictConditioner = try c.decodeIfPresent(Bool.self, forKey: .evictConditioner) ?? false
         bypassContentFilter = try c.decodeIfPresent(Bool.self, forKey: .bypassContentFilter) ?? false
+        loraPath = nil          // env-specific runtime override; not persisted
+        loraStrength = 1.0
     }
 
     /// The pre-quantized DiT filename in the artifacts repo (nil for bf16).

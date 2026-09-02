@@ -80,6 +80,16 @@ final class MageFlowRuntime {
             ditQuant: cfg.quantDiTFile.map { artifacts.appendingPathComponent($0) },
             cfg: pcfg,
             deferConditioner: cfg.evictConditioner)
+        // Runtime DiT-LoRA (AB-A-0050): applied after the DiT is resident, before any run.
+        // The adapter file is a local path (the store's loras/ dir, not a WeightSource);
+        // a missing file fails load() legibly rather than running the base silently.
+        if let loraPath = cfg.loraPath {
+            let url = URL(fileURLWithPath: (loraPath as NSString).expandingTildeInPath)
+            guard FileManager.default.fileExists(atPath: url.path) else {
+                throw MageFlowPackageError.unreadableSnapshot("LoRA not found: \(loraPath)")
+            }
+            try pipeline?.applyLoRA(loRAs: [(url, cfg.loraStrength)])
+        }
     }
 
     func unload() async {

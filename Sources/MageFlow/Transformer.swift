@@ -397,6 +397,8 @@ public final class MageFlowTransformer: Module {
     @ModuleInfo(key: "txt_in") var txtIn: Linear
     @ModuleInfo(key: "time_text_embed") var timeTextEmbed: MageFlowTimestepEmbeddings
     @ModuleInfo(key: "transformer_blocks") var blocks: [MageFlowTransformerBlock]
+    /// The 12 dual-stream blocks, exposed for the runtime LoRA applicator (MageFlowEdit/LoRA.swift).
+    public var transformerBlocks: [MageFlowTransformerBlock] { blocks }
     @ModuleInfo(key: "norm_out") var normOut: AdaLayerNormContinuous
     @ModuleInfo(key: "proj_out") var projOut: Linear
 

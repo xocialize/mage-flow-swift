@@ -4,6 +4,7 @@
 //         (refs are Image 1, Image 2, Image 3 in the instruction; 1–3 = upstream's trained range)
 //   t2i : mage-flow-edit --repo <dir> --t2i --prompt "<prompt>" --out <out.png>
 //   [--size 512] [--seed 42] [--steps N] [--cfg F] [--neg "<negative>"] [--renorm] [--no-filter]
+//   [--lora <adapter.safetensors> [--lora <second> …] [--lora-strength 1.0]]   runtime DiT-LoRA (AB-A-0050)
 //   Variant defaults: Base steps 30 / cfg 5.0 · RL steps 20 / cfg 5.0 · Turbo steps 4 / cfg 1.0
 //
 // <MageFlowEditRepoDir> is a downloaded mage-flow-community/Mage-Flow-Edit* snapshot plus
@@ -20,10 +21,14 @@ var cfg = MageFlowEditConfig()
 var filter = true
 var t2iMode = false
 var ditQuant: String?
+var loras: [String] = []            // --lora <path> (repeatable; rank-stacked)
+var loraStrength: Float = 1.0       // --lora-strength s (applies to every --lora)
 
 var it = CommandLine.arguments.dropFirst().makeIterator()
 while let arg = it.next() {
     switch arg {
+    case "--lora": if let p = it.next() { loras.append(p) }
+    case "--lora-strength": loraStrength = Float(it.next() ?? "") ?? loraStrength
     case "--repo": repo = it.next()
     case "--ref": if let r = it.next() { refs.append(r) }
     case "--prompt": prompt = it.next()
@@ -57,6 +62,12 @@ let pipe = try await MageFlowEditPipeline(
     ditQuant: ditQuant.map { URL(fileURLWithPath: $0) },
     cfg: cfg)
 FileHandle.standardError.write(Data("loaded in \(String(format: "%.1f", Date().timeIntervalSince(t0)))s\n".utf8))
+if !loras.isEmpty {
+    // Runtime DiT-LoRA (AB-A-0050): activation-path adapter on the resident DiT, every key must land.
+    let s = try pipe.applyLoRA(loRAs: loras.map { (URL(fileURLWithPath: $0), loraStrength) })
+    FileHandle.standardError.write(Data(
+        "lora: \(loras.count) adapter(s) @ strength \(loraStrength) → \(s.total) targets (\(s.bf16Targets) bf16, \(s.quantizedTargets) quantized)\n".utf8))
+}
 
 do {
     let t1 = Date()

@@ -79,6 +79,10 @@ let package = Package(
                 .product(name: "MLXServeCore", package: "mlx-engine-swift"),
             ],
             path: "Sources/MagePkgSmoke"),
+        // Structural smoke for the runtime DiT-LoRA applicator (AB-A-0050): synthetic adapters
+        // on a random-init DiT (bf16 + in-memory int8), no weights needed.
+        .executableTarget(
+            name: "mage-lora-smoke", dependencies: ["MageFlowEdit"], path: "Sources/MageLoRASmoke"),
         .testTarget(
             name: "MLXMageFlowTests",
             dependencies: [

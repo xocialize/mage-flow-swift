@@ -74,8 +74,11 @@ if surface == "edit" {
     let editPrompt = refImages.count > 1
         ? "Place the object from Image 1 into the scene of Image 2"
         : "make the background a snowy forest"
+    // MAGE_LORA_PATH=<adapter.safetensors>: the wrapper-level LoRA path (AB-A-0050) — applied by
+    // load() after the DiT is resident, i.e. exactly what a consumer app's configuration does.
+    let loraPath = ProcessInfo.processInfo.environment["MAGE_LORA_PATH"]
     let config = MageFlowConfiguration(
-        variant: .editTurbo, quant: quant, snapshotPath: root, defaultSize: 512)
+        variant: .editTurbo, quant: quant, snapshotPath: root, defaultSize: 512, loraPath: loraPath)
     // Engine-shaped construction: registration factory (C13), not direct init.
     let package = try MageFlowEditPackage.registration.makePackage(config)
     try await package.load()
