@@ -202,6 +202,37 @@ task-local sink, and `MLXMageFlow` forwards those events into `RunProgress`
 `mage-pkg-smoke` binds a print sink the way the engine does and **fails** if the per-step
 denoise counters do not cover the loop.
 
+## GPU numerics: MageVAE conditioning decoder (2026-09-24)
+
+mlx's Metal `conv2d` takes a Winograd F(6×6,3×3) path when the conv is 3×3, stride 1, dilation 1,
+groups 1, C % 32 == 0, O % 32 == 0, C + O ≥ 256 and N·H·W ≥ 4096. On M5 that path loses about
+6.4e-3 relL2 per conv in fp32, because its inner GEMM runs TF32.
+
+MageVAE hits it only in `codDecoder`: conv_in 128→384, six 384→384 resnet convs, and conv_out, all
+at latent resolution. It starts at 1024² output (latent 64²). The encoder is depthwise and 1×1
+throughout. The oracle golden is 512² (latent 32², below the window), and `MageVAEGate` pins the
+CPU, so neither could see this.
+
+`cv(...)` now routes in-window shapes through conv3d with kT = 1. This is the default, since it is
+eight convs at 64².
+
+Measurements: 1024² DIV2K photo, against the CPU lane.
+
+| | Raw conv2d (Winograd) | conv3d route |
+|---|---|---|
+| `codDecoder` conditioning | 2.1e-3 · max 1.8e-2 | 1.2e-4 · max 6.7e-4 |
+| Decode | 1.5e-3 · 68.7 dB | 5.0e-4 · 78.2 dB |
+| Decode time, 1024² | 579 ms | +14 ms |
+
+The residual after the route is TF32 in the patch attention and the one-step decoder's matmuls.
+
+Controls and tests:
+
+- Set `MAGEFLOW_VAE_CONV_ROUTE=winograd` to restore raw conv2d (read on every call).
+- `swift test --filter MageVAEGPULaneTests/testProbe` is weight-free.
+- `MAGE_PARITY=1 MAGE_VAE=… MAGE_FOLD=… swift test -c release -Xswiftc -enable-testing --filter
+  MageVAEGPULaneTests` compares the GPU and CPU lanes.
+
 ## Gates
 
 Each gate drives one component against captured oracle goldens on the CPU stream,

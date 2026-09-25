@@ -84,6 +84,14 @@ let package = Package(
         .executableTarget(
             name: "mage-lora-smoke", dependencies: ["MageFlowEdit"], path: "Sources/MageLoRASmoke"),
         .testTarget(
+            name: "MageFlowTests",
+            dependencies: [
+                "MageFlow",
+                .product(name: "MLX", package: "mlx-swift"),
+                .product(name: "MLXRandom", package: "mlx-swift"),
+            ],
+            path: "Tests/MageFlowTests"),
+        .testTarget(
             name: "MLXMageFlowTests",
             dependencies: [
                 "MLXMageFlow",

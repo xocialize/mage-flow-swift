@@ -65,7 +65,8 @@ func groupNorm(_ x: MLXArray, _ w: MLXArray, _ b: MLXArray,
 @inline(__always)
 func cv(_ x: MLXArray, _ w: MLXArray, _ b: MLXArray? = nil,
         stride: Int = 1, padding: Int = 0, groups: Int = 1) -> MLXArray {
-    let y = conv2d(x, w, stride: IntOrPair(stride), padding: IntOrPair(padding), groups: groups)
+    // In-window 3×3 convs take the exact conv3d route by default (WinogradConvRoute.swift).
+    let y = routedConv2d(x, w, stride: stride, padding: padding, groups: groups)
     return b.map { y + $0 } ?? y
 }
 
