@@ -867,9 +867,9 @@ the 4-line backport (clone at `WIP/mlx-swift-3810`):
 dispatch boundary — a loose (≥0.99) gate passes it. Probe with strict
 thresholds (`MageFlowGate --nax-probe`, cos > 0.999 AND max_abs < 100).
 
-Shipped code keeps the row-chunk (correct on stock AND fixed kernels). After any
-mlx-swift version bump: run `--nax-probe`; on PASS, delete `downProjected` here
-and `MLP.downProjected` in qwen3vl-mlx-swift.
+Shipped code kept the row-chunk until mlx-swift 0.32.3 carried the fix; it was removed
+2026-10-01 (here, and `MLP.downProjected` in qwen3vl-mlx-swift 0.4.0). `--nax-probe` stays as
+the regression check after any mlx-swift bump.
 
 
 ## Resolution range CLOSED: 512–2048 validated (2026-07-23)
@@ -880,8 +880,8 @@ row-chunk, 32 768 packed tokens): **mean_abs 2.57/255, PSNR 34.2 dB** — near-i
 images. The slightly painterly fur texture at 2048² appears in BOTH renders → it is the
 model's native 4×-base behaviour, not a port artifact. Range summary: 512² pixel-identical
 (earlier gate), 768²/1024²/1536² oracle renders coherent, 2048² at 34.2 dB. The full
-512–2048 claim on the cards is now evidence-backed. Remaining Mage-Flow item: delete the
-row-chunk when an mlx-swift release vendors mlx ≥ #3810 (probe first).
+512–2048 claim on the cards is now evidence-backed. (The row-chunk was removed 2026-10-01 on
+mlx-swift 0.32.3, after the probe passed.)
 
 ## Multi-reference edit (1–3 refs) — v0.6.0, 2026-09-02 (AB-A-0047)
 

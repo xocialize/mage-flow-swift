@@ -8,10 +8,8 @@
 // (I/O projections), proj_out, norm_out, img_mod / txt_mod (modulation), time embed,
 // and all norms. The modulation MLPs feed x*(1+scale)+shift — precision-sensitive.
 //
-// NOTE the NAX row-chunk (`MageFeedForward.downProjected`) only guards *bf16* Linears;
-// QuantizedLinear runs the QMM kernels, a different family. The chunk's dtype guard
-// (`x.dtype != .float32`) is inert for quantized layers because quantize() replaces the
-// Linear wholesale — downProjected is only reached on the bf16 path.
+// NOTE the NAX split-K GEMM bug (mlx#3797, fixed in mlx-swift 0.32.3, the manifest floor) hit
+// *bf16* Linears only; QuantizedLinear runs the QMM kernels, a different family.
 
 import Foundation
 import MLX

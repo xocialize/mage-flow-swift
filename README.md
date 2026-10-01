@@ -75,13 +75,13 @@ Qwen3-VL-4B conditioning + the content filter come from
 
 - **The bf16 "grid garbage at ≥512²" was the mlx-swift NAX split-K GEMM bug**
   ([ml-explore/mlx#3797](https://github.com/ml-explore/mlx/issues/3797), fixed
-  upstream by [#3810](https://github.com/ml-explore/mlx/pull/3810) but not yet
-  in an mlx-swift release ≤0.31.6): mlx-swift JIT-compiles
+  upstream by [#3810](https://github.com/ml-explore/mlx/pull/3810), shipped in
+  mlx-swift 0.32.3): mlx-swift ≤0.31.6 JIT-compiles
   `steel_gemm_splitk_axpby_nax` and the 26.x/27.x Metal toolchain miscompiles it
   on M5-class GPUs. The DiT's FFN `proj_out` (K=12288, N=3072) enters the
   dispatch window at 1366 image tokens — a 512² edit packs 2048.
-  `MageFeedForward.downProjected` row-chunks below the boundary (exact), so the
-  DiT now **runs bf16 by default** (~2× faster than fp32, half the memory);
+  It was row-chunked below the boundary until mlx-swift 0.32.3 (now the floor)
+  fixed it; the DiT **runs bf16 by default** (~2× faster than fp32, half the memory);
   `MAGEFLOW_FP32` remains for parity work. Same root cause as Boogu-Image's
   `useFP32DiT` and qwen3vl's `down_proj` chunking.
 - **The timestep embedding is bf16-rounded twice** — the sigma *and* the

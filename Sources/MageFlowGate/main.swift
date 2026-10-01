@@ -48,8 +48,8 @@ func check(_ name: String, _ a: MLXArray, _ g: MLXArray) {
 let args = Array(CommandLine.arguments.dropFirst())
 // Weights-free NAX split-K GEMM probe at the exact Mage DiT FFN shapes.
 // mlx-swift <=0.31.6 JIT-miscompiles steel_gemm_splitk_axpby_nax (mlx#3797,
-// fixed by mlx#3810): M=896 clean / M>=1024 garbage. Run after any mlx-swift
-// bump to decide whether MageFeedForward.downProjected can drop its row-chunk.
+// fixed by mlx#3810, shipped in mlx-swift 0.32.3): M=896 clean / M>=1024 garbage on
+// <=0.31.6. Regression check since the row-chunk was removed — run after any mlx-swift bump.
 //   MageFlowGate --nax-probe
 if args.first == "--nax-probe" {
     var lcg: UInt64 = 0x9E37_79B9_7F4A_7C15
@@ -74,7 +74,7 @@ if args.first == "--nax-probe" {
         err(String(format: "  M=%d K=%d N=%d bf16: cos %.8f max_abs %.3e  %@",
                    m, K, N, c, mab, (pass ? "OK" : "BROKEN") as NSString))
     }
-    err("[nax-probe] \(ok ? "PASS — kernel fixed, row-chunk removable" : "FAIL — keep the row-chunk")")
+    err("[nax-probe] \(ok ? "PASS — split-K GEMM clean" : "FAIL — NAX split-K regression (mlx#3797): bf16 edits will corrupt")")
     exit(ok ? 0 : 1)
 }
 

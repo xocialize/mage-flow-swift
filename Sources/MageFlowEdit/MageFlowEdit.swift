@@ -144,8 +144,8 @@ public final class MageFlowEditPipeline {
             // bf16 by default (upstream dtype). The former "grid garbage at >=512^2"
             // was root-caused to the mlx-swift <=0.31.6 JIT-miscompiled NAX split-K
             // GEMM (ml-explore/mlx#3797, fixed by #3810) hitting the FFN proj_out at
-            // >=1366 image tokens; MageFeedForward.downProjected now row-chunks
-            // around it exactly. MAGEFLOW_FP32 remains for parity work.
+            // >=1366 image tokens; mlx-swift 0.32.3 (the manifest floor) carries the fix.
+            // MAGEFLOW_FP32 remains for parity work.
             let ditDtype: DType = ProcessInfo.processInfo.environment["MAGEFLOW_FP32"] != nil ? .float32 : .bfloat16
             let w = model.sanitize(weights: raw).mapValues { $0.asType(ditDtype) }
             let missing = keys.subtracting(Set(w.keys))
