@@ -4,6 +4,7 @@
 //         (refs are Image 1, Image 2, Image 3 in the instruction; 1–3 = upstream's trained range)
 //   t2i : mage-flow-edit --repo <dir> --t2i --prompt "<prompt>" --out <out.png>
 //   [--size 512] [--seed 42] [--steps N] [--cfg F] [--neg "<negative>"] [--renorm] [--no-filter]
+//   [--init-sigma S]   image-to-image start from Image 1 at sigma S in (0, 1] (creative upscale / re-detail)
 //   [--lora <adapter.safetensors> [--lora <second> …] [--lora-strength 1.0]]   runtime DiT-LoRA (AB-A-0050)
 //   Variant defaults: Base steps 30 / cfg 5.0 · RL steps 20 / cfg 5.0 · Turbo steps 4 / cfg 1.0
 //
@@ -41,6 +42,7 @@ while let arg = it.next() {
     case "--cfg": cfg.cfg = Float(it.next() ?? "") ?? cfg.cfg
     case "--neg": cfg.negPrompt = it.next() ?? cfg.negPrompt
     case "--renorm": cfg.renormalization = true
+    case "--init-sigma": cfg.initSigma = Float(it.next() ?? "").flatMap { $0 > 0 && $0 <= 1 ? $0 : nil }
     case "--dit-quant": ditQuant = it.next()
     default: fail("unknown arg \(arg)")
     }

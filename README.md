@@ -169,6 +169,24 @@ The first real checkpoint (the pod's 250-step save) is the live applicator test:
 `mage-lora-smoke apply <ckpt.safetensors> [int8]` prints the landed-target summary and flags a
 count ≠ 144. No licence-clean community Mage LoRA exists yet to gate against.
 
+## Image-to-image start — `initSigma` (creative upscale) — v0.10.0, G-5
+
+`MageFlowEditConfig.initSigma` (σ in (0, 1]) starts the target from **Image 1's latent noised to σ** instead of
+pure noise, and spends all `steps` below it: `FlowMatchEulerScheduler(startSigma:)` scales the shifted base grid
+so its first sigma is exactly σ. Absent or 1.0 is the unchanged edit (identical sigma array, no mix). Lower σ keeps
+more of Image 1. The Gaussian-Shading watermark noise is then only partly present in the result.
+
+- **Package:** `IEditRequest.metaData["initSigma"]` (`MageFlowMetaKeys.initSigmaKey`), validated before any model
+  work; outside (0, 1] or non-numeric → `unsupportedRequestFeature`. Reset after every request.
+- **CLI:** `--init-sigma S`.
+- **ComfyUI equivalence:** `denoise d` on this shift-6 schedule starts at σ = 6d / (1 + 5d); the CivitAI Mage
+  restoration workflow's `denoise 0.88` is σ ≈ 0.978.
+
+First consumer: the creative upscale (Gigapixel gap G-5, `mlxengine-todo/CREATIVE-UPSCALE-EVAL.md`) — precision
+upscale to the target, then Mage-Edit-Turbo over ≤ 1024² tiles at σ ≈ 0.9 with a content-free instruction. There
+σ 0.85–0.93 keeps framing, glyphs and eye colour; σ 1.0 at ×4 rebuilds tile fragments of faces and letters;
+below 0.85 it smooths more than it adds. Tests: `SchedulerStartSigmaTests` (3), `InitSigmaMetaTests` (2).
+
 ## Run-phase progress
 
 Both packages report into the engine's `RunProgress` plane (contract 1.18.0), so a

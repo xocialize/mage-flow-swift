@@ -65,6 +65,11 @@ public struct MageFlowEditConfig {
     public var cfg: Float = 1.0         // Base 5.0 / RL 5.0 / Turbo 1.0
     public var negPrompt = " "          // upstream default: a single SPACE (truthy)
     public var renormalization = false
+    /// Image-to-image start (creative upscale / re-detail): when set, the target starts from
+    /// Image 1's latent noised to this sigma instead of pure noise, and the schedule runs
+    /// from it (`FlowMatchEulerScheduler(startSigma:)`). Lower keeps more of Image 1;
+    /// nil (default) is the unchanged edit.
+    public var initSigma: Float? = nil
     public init() {}
 }
 
@@ -527,7 +532,13 @@ public final class MageFlowEditPipeline {
         // --- Gaussian-Shading target noise --------------------------------
         let noise = gaussianShadingNoise(
             channels: 128, height: lh, width: lw, key: cfg.gsKey, seed: cfg.seed)
-        let target = MLXArray(noise, [1, 128, lh, lw]).transposed(0, 2, 3, 1)
+        var target = MLXArray(noise, [1, 128, lh, lw]).transposed(0, 2, 3, 1)
+        // Image-to-image start: flow-matching interpolation x_s = (1 - s)·x0 + s·noise from
+        // Image 1's clean latent (the Gaussian-Shading watermark is then only partly present).
+        let startSigma = cfg.initSigma.map { min(max($0, 1e-4), 1) } ?? 1
+        if startSigma < 1 {
+            target = (1 - startSigma) * refLatents[0] + startSigma * target.asType(refLatents[0].dtype)
+        }
 
         // --- pack + denoise -----------------------------------------------
         // [target, ref_1 … ref_N]; one shape entry per member — the enumeration
@@ -536,7 +547,7 @@ public final class MageFlowEditPipeline {
             [target.reshaped(1, lh * lw, 128)] + refLatents.map { $0.reshaped(1, lh * lw, 128) },
             axis: 1).asType(ditDtype)
         let shapes = Array(repeating: (frame: 1, height: lh, width: lw), count: n + 1)
-        let sched = FlowMatchEulerScheduler(steps: cfg.steps, shift: cfg.shift)
+        let sched = FlowMatchEulerScheduler(steps: cfg.steps, shift: cfg.shift, startSigma: startSigma)
         let pipe = MageFlowPipeline(transformer: transformer)
         let out = pipe.denoise(img: packed, txt: feats.asType(ditDtype),
                                targetLen: lh * lw, imgShapes: shapes, scheduler: sched,

@@ -17,12 +17,20 @@ public struct FlowMatchEulerScheduler {
     /// base sigmas = linspace(1.0, 1/steps, steps), then the static shift
     ///   sigma' = shift * sigma / (1 + (shift - 1) * sigma)
     /// and a terminal 0.
-    public init(steps: Int, shift: Float = 6.0, numTrainTimesteps: Float = 1000) {
+    ///
+    /// `startSigma` < 1 starts the schedule part-way down (image-to-image / SDEdit): the base
+    /// grid is scaled by the base value whose shifted sigma is `startSigma`, so the first
+    /// sigma equals `startSigma` and all `steps` steps are spent below it. 1.0 is the
+    /// unchanged schedule.
+    public init(steps: Int, shift: Float = 6.0, numTrainTimesteps: Float = 1000,
+                startSigma: Float = 1.0) {
         self.shift = shift
+        let s0 = min(max(startSigma, 1e-4), 1.0)
+        let b0 = s0 / (shift - (shift - 1) * s0)                // inverse of the shift map
         var s: [Float] = []
         for i in 0 ..< steps {
             let t = steps == 1 ? 0 : Float(i) / Float(steps - 1)
-            let base = 1.0 + t * (1.0 / Float(steps) - 1.0)     // linspace(1, 1/steps, steps)
+            let base = b0 * (1.0 + t * (1.0 / Float(steps) - 1.0))  // b0 · linspace(1, 1/steps, steps)
             s.append(shift * base / (1 + (shift - 1) * base))
         }
         self.timesteps = s.map { $0 * numTrainTimesteps }

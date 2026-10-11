@@ -103,12 +103,13 @@ final class MageFlowRuntime {
     /// `refImages` empty ⇒ t2i; 1…`MageFlowEditConfig.maxReferences` ⇒ edit, in prompt order.
     func generate(
         prompt: String, negativePrompt: String?, width: Int?, steps: Int?,
-        guidance: Double?, seed: UInt64?, refImages: [Image]
+        guidance: Double?, seed: UInt64?, refImages: [Image], initSigma: Float? = nil
     ) async throws -> Image {
         guard let pipeline else { throw PackageError.notLoaded }
         let cfg = configuration
         let base = pipeline.cfg
         defer { pipeline.cfg = base }
+        pipeline.cfg.initSigma = initSigma
         pipeline.cfg.size = ((width ?? cfg.defaultSize) / 16) * 16
         pipeline.cfg.steps = steps ?? cfg.defaultSteps
         pipeline.cfg.cfg = Float(guidance ?? Double(cfg.guidanceScale))
@@ -313,14 +314,39 @@ public final class MageFlowEditPackage: ModelPackage {
             throw PackageError.unsupportedRequestFeature(
                 "non-square output (\(w)×\(h)) — Mage-Flow's validated envelope is square 512–2048")
         }
+        let initSigma = try MageFlowMetaKeys.initSigma(edit.metaData)
         let image = try await runtime.generate(
             prompt: edit.prompt, negativePrompt: edit.negativePrompt,
             width: edit.width ?? edit.height, steps: edit.steps,
-            guidance: edit.guidanceScale, seed: edit.seed, refImages: edit.images)
+            guidance: edit.guidanceScale, seed: edit.seed, refImages: edit.images,
+            initSigma: initSigma)
         return IEditResponse(image: image)
     }
 }
 
 extension MageFlowEditPackage {
     public nonisolated static var registration: PackageRegistration { .of(MageFlowEditPackage.self) }
+}
+
+/// Package-specific `IEditRequest.metaData` levers (contract C5).
+public enum MageFlowMetaKeys {
+    /// Image-to-image start sigma in (0, 1]: the target starts from Image 1's latent noised to this sigma instead of
+    /// pure noise (`MageFlowEditConfig.initSigma`). Lower keeps more of Image 1 — the creative-upscale / re-detail
+    /// lever (G-5: 0.85–0.93 keeps framing, text and eye colour; 1.0 is the unchanged edit). Absent = 1.0.
+    public static let initSigmaKey = "initSigma"
+
+    static func initSigma(_ meta: MetaData) throws -> Float? {
+        guard let v = meta[initSigmaKey] else { return nil }
+        let s: Double
+        switch v {
+        case .double(let d): s = d
+        case .int(let i): s = Double(i)
+        case .null: return nil
+        default: throw PackageError.unsupportedRequestFeature("metaData[\"\(initSigmaKey)\"] must be a number in (0, 1]")
+        }
+        guard s > 0, s <= 1 else {
+            throw PackageError.unsupportedRequestFeature("metaData[\"\(initSigmaKey)\"] = \(s) is outside (0, 1]")
+        }
+        return Float(s)
+    }
 }
