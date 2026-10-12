@@ -31,7 +31,10 @@ let package = Package(
         // the package no longer carries its own WeightMaterializer.
         .package(url: "https://github.com/xocialize/mlx-engine-swift", from: "0.32.0"),
         .package(url: "https://github.com/xocialize/mlx-profiling.git", from: "0.1.0"),
-        .package(url: "https://github.com/xocialize/mlx-exact-conv-swift", from: "0.1.0"),
+        // ≥0.1.1: 0.1.0's exact conv reached an mlx channel-pad helper that frees its zero fill value
+        // mid-flight; under a capped MLX cache that killed the host with a Metal "Invalid Resource"
+        // fault (AB-T-0214).
+        .package(url: "https://github.com/xocialize/mlx-exact-conv-swift", from: "0.1.1"),
     ],
     targets: [
         .target(
