@@ -41,7 +41,8 @@ public enum MageFlowPackageError: Error, LocalizedError {
 enum MageProgressBridge {
     static let forward: MageProgress.Sink = { e in
         RunProgress.report(RunPhase(rawValue: e.phase.rawValue),
-                           step: e.step, totalSteps: e.totalSteps)
+                           step: e.step, totalSteps: e.totalSteps,
+                           stage: e.stage, totalStages: e.totalStages)
     }
 }
 
@@ -54,6 +55,13 @@ final class MageFlowRuntime {
     private var pipeline: MageFlowEditPipeline?
 
     nonisolated init(configuration: MageFlowConfiguration) { self.configuration = configuration }
+
+    /// How many times the conditioner and the DiT have been loaded, and the time it took (receipts and tests).
+    var loads: MageModelLoads {
+        MageModelLoads(conditioner: pipeline?.conditionerLoads ?? 0, transformer: pipeline?.transformerLoads ?? 0,
+                       conditionerSeconds: pipeline?.conditionerLoadSeconds ?? 0,
+                       transformerSeconds: pipeline?.transformerLoadSeconds ?? 0)
+    }
 
     func load() async throws {
         guard pipeline == nil else { return }
@@ -79,7 +87,8 @@ final class MageFlowRuntime {
             foldedAdaLN: artifacts.appendingPathComponent("folded_adaln.safetensors"),
             ditQuant: cfg.quantDiTFile.map { artifacts.appendingPathComponent($0) },
             cfg: pcfg,
-            deferConditioner: cfg.evictConditioner)
+            deferConditioner: cfg.dropsConditioner,
+            deferTransformer: cfg.evictTransformer)
         // Runtime DiT-LoRA (AB-A-0050): applied after the DiT is resident, before any run.
         // The adapter file is a local path (the store's loras/ dir, not a WeightSource);
         // a missing file fails load() legibly rather than running the base silently.
@@ -97,10 +106,31 @@ final class MageFlowRuntime {
         MLX.Memory.clearCache()
     }
 
+    /// Per-request canonical overrides onto the pipeline's config (restored by the caller).
+    private func applyOverrides(_ pipeline: MageFlowEditPipeline, negativePrompt: String?, width: Int?,
+                                steps: Int?, guidance: Double?, seed: UInt64?, initSigma: Float?) {
+        let cfg = configuration
+        pipeline.cfg.initSigma = initSigma
+        pipeline.cfg.size = ((width ?? cfg.defaultSize) / 16) * 16
+        pipeline.cfg.steps = steps ?? cfg.defaultSteps
+        pipeline.cfg.cfg = Float(guidance ?? Double(cfg.guidanceScale))
+        if let seed { pipeline.cfg.seed = seed }
+        if let negativePrompt, !negativePrompt.isEmpty { pipeline.cfg.negPrompt = negativePrompt }
+    }
+
+    /// After a request the light tiers release what they hold (a refused or cancelled run may
+    /// still hold the conditioner).
+    private func releaseAfterRequest(_ pipeline: MageFlowEditPipeline) {
+        if configuration.dropsConditioner { pipeline.dropConditioner() }
+        if configuration.evictTransformer { pipeline.dropTransformer() }
+    }
+
     /// Apply per-request canonical overrides, run one generation, encode PNG.
     /// CancellationError from the pipeline seams propagates UNCHANGED; the
     /// upstream filter's refusal is re-thrown as a legible package error.
     /// `refImages` empty ⇒ t2i; 1…`MageFlowEditConfig.maxReferences` ⇒ edit, in prompt order.
+    /// The conditioning runs first; on the light tiers the conditioner leaves memory before the
+    /// DiT loads (`evictTransformer`: the DiT is out while the conditioner is in).
     func generate(
         prompt: String, negativePrompt: String?, width: Int?, steps: Int?,
         guidance: Double?, seed: UInt64?, refImages: [Image], initSigma: Float? = nil
@@ -109,37 +139,39 @@ final class MageFlowRuntime {
         let cfg = configuration
         let base = pipeline.cfg
         defer { pipeline.cfg = base }
-        pipeline.cfg.initSigma = initSigma
-        pipeline.cfg.size = ((width ?? cfg.defaultSize) / 16) * 16
-        pipeline.cfg.steps = steps ?? cfg.defaultSteps
-        pipeline.cfg.cfg = Float(guidance ?? Double(cfg.guidanceScale))
-        if let seed { pipeline.cfg.seed = seed }
-        if let negativePrompt, !negativePrompt.isEmpty { pipeline.cfg.negPrompt = negativePrompt }
+        applyOverrides(pipeline, negativePrompt: negativePrompt, width: width, steps: steps,
+                       guidance: guidance, seed: seed, initSigma: initSigma)
 
         let prof = MLXProfiler.shared
         prof.beginRun("mage-flow \(refImages.isEmpty ? "t2i" : "edit×\(refImages.count)") \(cfg.variant.rawValue) "
             + "q=\(cfg.quant) steps=\(pipeline.cfg.steps) g=\(pipeline.cfg.cfg) "
-            + "\(pipeline.cfg.size)² evict=\(cfg.evictConditioner)")
+            + "\(pipeline.cfg.size)² evict=\(cfg.evictConditioner)/\(cfg.evictTransformer)")
         defer {
             prof.endRun(denominators: ["step": Double(pipeline.cfg.steps)])
-            if cfg.evictConditioner { pipeline.dropConditioner() }
+            releaseAfterRequest(pipeline)
         }
         // The Responsible-AI screen runs unless the caller opted to bypass it.
         let screen = !cfg.bypassContentFilter
+        let dropsConditioner = cfg.dropsConditioner
         do {
             // Bind the core's phase sink for exactly this generation; the events land in the
             // engine's RunProgress plane, whose own sink the engine bound around run().
             let nhwc: MLXArray = try MageProgress.$sink.withValue(MageProgressBridge.forward) {
+                if cfg.evictTransformer { pipeline.dropTransformer() }
+                let stop: () -> Bool = { Task.isCancelled }
                 if !refImages.isEmpty {
                     let refs = try refImages.map { image -> MageRefImage in
                         let (rgb, w, h) = try MageFlowEditPipeline.decodeRGB(data: image.data)
                         return MageRefImage(rgb: rgb, width: w, height: h)
                     }
-                    return try pipeline.edit(refs: refs, instruction: prompt, screen: screen,
-                                             shouldStop: { Task.isCancelled })
+                    let c = try pipeline.editConditioning(refs: refs, instruction: prompt, screen: screen,
+                                                          shouldStop: stop)
+                    if dropsConditioner { pipeline.dropConditioner() }
+                    return try pipeline.editRender(refs: refs, c, shouldStop: stop)
                 } else {
-                    return try pipeline.t2i(prompt: prompt, screen: screen,
-                                            shouldStop: { Task.isCancelled })
+                    let c = try pipeline.t2iConditioning(prompt: prompt, screen: screen, shouldStop: stop)
+                    if dropsConditioner { pipeline.dropConditioner() }
+                    return try pipeline.t2iRender(c, shouldStop: stop)
                 }
             }
             try Task.checkCancellation()
@@ -147,6 +179,65 @@ final class MageFlowRuntime {
             RunProgress.report(.postprocess)
             let (png, w, h) = try MageFlowEditPipeline.encodePNG(nhwc)
             return Image(format: .png, data: png, width: w, height: h)
+        } catch let e as MageFlowEditError {
+            if case .refused(let verdict) = e { throw MageFlowPackageError.contentRefused(verdict) }
+            throw e
+        }
+    }
+
+    /// The `tiles` mode (`MageFlowModes.tiles`): each image edited on its own with the same
+    /// instruction — as Image 1 of its own edit, at the request's square size and start sigma,
+    /// image k at `seed + k` — through `MageFlowEditPipeline.editBatch`: every tile's conditioning
+    /// in one conditioner load, then every tile's denoise and decode. Returns the edits stacked
+    /// top to bottom in input order, one PNG `side` wide and `tiles.count × side` tall, each band
+    /// byte-identical to `generate` alone on that tile at that seed.
+    func generateTiles(
+        prompt: String, negativePrompt: String?, width: Int?, steps: Int?,
+        guidance: Double?, seed: UInt64?, tiles: [Image], initSigma: Float? = nil
+    ) async throws -> Image {
+        guard let pipeline else { throw PackageError.notLoaded }
+        let cfg = configuration
+        let base = pipeline.cfg
+        defer { pipeline.cfg = base }
+        applyOverrides(pipeline, negativePrompt: negativePrompt, width: width, steps: steps,
+                       guidance: guidance, seed: seed, initSigma: initSigma)
+        let side = pipeline.cfg.size
+        let seed0 = pipeline.cfg.seed
+
+        let prof = MLXProfiler.shared
+        prof.beginRun("mage-flow edit-tiles×\(tiles.count) \(cfg.variant.rawValue) q=\(cfg.quant) "
+            + "steps=\(pipeline.cfg.steps) g=\(pipeline.cfg.cfg) \(side)² "
+            + "evict=\(cfg.evictConditioner)/\(cfg.evictTransformer)")
+        defer {
+            prof.endRun(denominators: ["step": Double(pipeline.cfg.steps * tiles.count)])
+            releaseAfterRequest(pipeline)
+        }
+        let screen = !cfg.bypassContentFilter
+        let dropsConditioner = cfg.dropsConditioner
+        do {
+            let jobs = try tiles.enumerated().map { k, image -> MageEditJob in
+                let (rgb, w, h) = try MageFlowEditPipeline.decodeRGB(data: image.data)
+                return MageEditJob(refs: [MageRefImage(rgb: rgb, width: w, height: h)],
+                                   seed: seed0 &+ UInt64(k), size: side, initSigma: initSigma)
+            }
+            let band = side * side * 3
+            var strip = [UInt8](repeating: 0, count: band * tiles.count)
+            try MageProgress.$sink.withValue(MageProgressBridge.forward) {
+                if cfg.evictTransformer { pipeline.dropTransformer() }
+                try pipeline.editBatch(jobs, instruction: prompt, screen: screen,
+                                       releaseConditioner: dropsConditioner,
+                                       shouldStop: { Task.isCancelled }) { k, nhwc in
+                    let (rgb, w, h) = MageFlowEditPipeline.rgb8(nhwc)
+                    guard w == side, h == side, rgb.count == band else {
+                        throw MageFlowEditError.load("tile \(k) decoded \(w)×\(h), expected \(side)²")
+                    }
+                    strip.replaceSubrange(k * band ..< (k + 1) * band, with: rgb)
+                }
+            }
+            try Task.checkCancellation()
+            RunProgress.report(.postprocess)
+            let png = try MageFlowEditPipeline.encodePNG(rgb: strip, width: side, height: side * tiles.count)
+            return Image(format: .png, data: png, width: side, height: side * tiles.count)
         } catch let e as MageFlowEditError {
             if case .refused(let verdict) = e { throw MageFlowPackageError.contentRefused(verdict) }
             throw e
@@ -271,8 +362,10 @@ public final class MageFlowEditPackage: ModelPackage {
                         + "primary; the trained range); square 512–2048. Tiers "
                         + "via configuration: RL (20/5), Base (30/5), Turbo (4 steps, ~2.4 s "
                         + "@512²). Mandatory fail-closed content filter + Gaussian-Shading "
-                        + "watermark.",
-                    modes: []
+                        + "watermark. Mode `tiles`: each image edited on its own with the same "
+                        + "instruction (image k at seed + k, one conditioner load for all), "
+                        + "returned stacked top to bottom in input order.",
+                    modes: [MageFlowModes.tiles]
                 )
             ]
         )
@@ -302,6 +395,7 @@ public final class MageFlowEditPackage: ModelPackage {
         guard !edit.images.isEmpty else {
             throw PackageError.unsupportedRequestFeature("imageEdit requires at least one reference image")
         }
+        if edit.mode == MageFlowModes.tiles { return try await runTiles(edit) }
         // 1…3 references in prompt order (Image 1 = primary) — upstream's TRAINED range
         // (AB-A-0047, multi-ref landed 2026-09-02). Beyond 3 is untested territory upstream
         // too ("trained with up to 3, but more are accepted"): reject legibly rather than
@@ -326,6 +420,51 @@ public final class MageFlowEditPackage: ModelPackage {
 
 extension MageFlowEditPackage {
     public nonisolated static var registration: PackageRegistration { .of(MageFlowEditPackage.self) }
+
+    /// How many times this package has loaded its Qwen3-VL conditioner and its DiT, and how long that took
+    /// (diagnostics: the light tiers reload them per request; a `tiles` request loads each once).
+    public var modelLoads: MageModelLoads { runtime.loads }
+
+    /// `MageFlowModes.tiles`: validated before any model work.
+    func runTiles(_ edit: IEditRequest) async throws -> IEditResponse {
+        guard edit.images.count <= MageFlowModes.maxTiles else {
+            throw PackageError.unsupportedRequestFeature(
+                "\(edit.images.count) tiles — the tiles mode takes at most \(MageFlowModes.maxTiles) per request")
+        }
+        if let w = edit.width, let h = edit.height, w != h {
+            throw PackageError.unsupportedRequestFeature(
+                "non-square tiles (\(w)×\(h)) — Mage-Flow's validated envelope is square 512–2048")
+        }
+        let initSigma = try MageFlowMetaKeys.initSigma(edit.metaData)
+        let image = try await runtime.generateTiles(
+            prompt: edit.prompt, negativePrompt: edit.negativePrompt,
+            width: edit.width ?? edit.height, steps: edit.steps,
+            guidance: edit.guidanceScale, seed: edit.seed, tiles: edit.images,
+            initSigma: initSigma)
+        return IEditResponse(image: image)
+    }
+}
+
+/// Model loads since `load()` (`MageFlowEditPackage.modelLoads`).
+public struct MageModelLoads: Sendable, Equatable {
+    public var conditioner: Int
+    public var transformer: Int
+    public var conditionerSeconds: Double
+    public var transformerSeconds: Double
+}
+
+/// Package modes on `IEditRequest.mode` (contract C4).
+public enum MageFlowModes {
+    /// Each image is edited on its own with the same instruction — as Image 1 of its own edit, at
+    /// the request's square size (`width`) and start sigma (`metaData["initSigma"]`), image k at
+    /// `seed + k` (wrapping) — and the conditioner loads once for the whole request (the creative
+    /// upscale's tiles, G-5). The response's one image is the edits stacked top to bottom in
+    /// input order: `width` wide, `images.count × width` tall; band k is byte-identical to a plain
+    /// edit of image k at `seed + k`. With `evictConditioner` / `evictTransformer` this is the
+    /// small-Mac path: one conditioner load and one DiT load per request instead of per tile.
+    public static let tiles: Mode = "tiles"
+    /// Tiles per request (a 32 MP creative ×4 is at most ~56 tiles of 1024²).
+    public static let maxTiles = 64
 }
 
 /// Package-specific `IEditRequest.metaData` levers (contract C5).

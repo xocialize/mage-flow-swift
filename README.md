@@ -187,6 +187,62 @@ upscale to the target, then Mage-Edit-Turbo over ≤ 1024² tiles at σ ≈ 0.9 
 σ 0.85–0.93 keeps framing, glyphs and eye colour; σ 1.0 at ×4 rebuilds tile fragments of faces and letters;
 below 0.85 it smooths more than it adds. Tests: `SchedulerStartSigmaTests` (3), `InitSigmaMetaTests` (2).
 
+## Tiles in one call, and the small-Mac tiers — v0.11.0, G-5
+
+The creative upscale edits 6–25 tiles per image. One `imageEdit` call per tile is fine while everything stays loaded,
+but a small Mac can't hold the Qwen3-VL conditioner (8.3 GB) and the DiT (5.6 GB at int8) at once, and reloading the
+conditioner per tile reads ~8 GB per tile.
+
+- **The pipeline is two phases.** `editConditioning` (content filter + Qwen3-VL features: the only part that needs the
+  conditioner) and `editRender` (reference latents, start, denoise, decode at `cfg`'s size, seed and start sigma);
+  `edit` is the two in a row. T2I splits the same way (`t2iConditioning` / `t2iRender`).
+- **`editBatch(_ jobs:)`** runs every job's conditioning in one conditioner load, drops the conditioner
+  (`releaseConditioner`), then renders every job. Each `MageEditJob` keeps its own references, seed, size and start
+  sigma, so job k's output is the one `edit` makes alone with them.
+- **Package mode `tiles`** (`MageFlowModes.tiles`, declared on the `imageEdit` surface): each image of the request is
+  edited on its own with the same instruction, as Image 1 of its own edit, at the request's square `width` and
+  `metaData["initSigma"]`, image k at `seed + k`. MLXToolKit's `IEditResponse` carries one image, so the edits come back
+  **stacked top to bottom in input order**: `width` wide, `count × width` tall. Up to 64 tiles per request
+  (`MageFlowModes.maxTiles`); progress reports tile k as `stage` k of n. No contract change.
+- **Residency tiers** (`MageFlowConfiguration`):
+
+  | tier | conditioner | DiT | peak (Turbo int8, measured) |
+  |---|---|---|---|
+  | resident (default) | stays | stays | 16.9–17.1 GB MLX |
+  | `evictConditioner` | leaves after each encode, before the denoise | stays | 15.1 GB |
+  | `evictTransformer` (implies the above) | takes turns with the DiT | out while the conditioner is in, and between requests | **10.3–10.7 GB** |
+
+  The light tiers reload what they dropped on every request: a plain edit per tile reloads both models per tile, a
+  `tiles` request once. `MageFlowEditPackage.modelLoads` counts the loads and their time. Before 0.11.0
+  `evictConditioner` dropped the conditioner only after the whole request, so its peak was still conditioner +
+  denoise (16.1 GB measured).
+
+Measured (M5 Max, Release, weights in the page cache; a 1024² own render upscaled ×2 → 9 tiles of 768² and
+×4 → 25 tiles of 928²; σ 0.9; MLX memory limit 12.7 GB on the light arms, a 16 GB Mac's GPU budget):
+
+| tier · path | ×2 total (per tile) | ×4 total (per tile) | MLX peak ×2 / ×4 | process peak ×2 / ×4 | loads at ×4 (cond. / DiT) |
+|---|---|---|---|---|---|
+| resident · per tile (v0.10.0, today's ≥ 32 GB) | 22.9 s (2.54) | 79.3 s (3.17) | 16.9 / 17.1 GB | 21.8 / 23.0 GB | 1 / 1 |
+| resident · `tiles` | 16.9 s (1.88) | 72.6 s (2.90) | 16.9 / 17.4 GB | 21.6 / 23.0 GB | 1 / 1 |
+| `evictConditioner` · per tile (v0.10.0) | 30.7 s (3.41) | 126.4 s (5.06) | 16.1 / 16.5 GB | 16.5 / 17.0 GB | 25 / 1 |
+| `evictConditioner` · `tiles` | 18.6 s (2.07) | 81.5 s (3.26) | 15.1 / 15.2 GB | 15.4 / 15.5 GB | 1 / 1 |
+| `evictTransformer` · per tile | 23.5 s (2.61) | 83.7 s (3.35) | 10.7 / 10.7 GB | 11.7 / 11.9 GB | 25 / 25 |
+| **`evictTransformer` · `tiles`** (the small-Mac path) | **19.7 s (2.19)** | **72.6 s (2.90)** | **10.3 / 10.3 GB** | **11.3 / 11.5 GB** | **1 / 1** |
+
+Each arm is its own process, so its total includes the first call's warm-up. Warm (one edit first), per ×4 tile on
+the `tiles` path: conditioner encode (Qwen3-VL features + the reference's VAE encode) 0.10 s, denoise 2.60 s, decode
+0.15 s; the lightest tier adds its two loads once per request (0.22 s + 0.15 s here). This Mac keeps every weight in
+its page cache, so those reloads are a floor; one plain edit per tile on the lightest tier still cost 0.45–1.34 s more
+per tile than `tiles` (two runs: 25 loads of each model, and a slower first denoise after every fresh DiT). A 16 GB Mac
+can't cache 13.9 GB of weights, so there every reload is a disk read: 13.9 GB per tile (~350 GB for a ×4)
+against 13.9 GB per request with `tiles`.
+
+Every arm returns **the same bytes for every tile** at the same seeds — v0.10.0 per tile, the new per-tile path and
+the `tiles` mode, on every tier. Tests: `TilesModeTests` (8 offline: the mode's validation, the light tiers'
+configuration and footprints, stage progress; 1 live, `MAGEFLOW_LIVE_STORE=<store>`: three 512² tiles on the
+resident and lightest tiers, each band byte-identical to its plain edit, conditioner and DiT loaded once per `tiles`
+request against once per tile).
+
 ## Run-phase progress
 
 Both packages report into the engine's `RunProgress` plane (contract 1.18.0), so a

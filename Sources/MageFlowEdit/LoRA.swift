@@ -222,12 +222,3 @@ public enum MageLoRA {
         try apply(loRAs: [(url, strength)], to: model, dtype: dtype)
     }
 }
-
-extension MageFlowEditPipeline {
-    /// Apply LoRA adapter(s) to this pipeline's resident DiT (edit AND t2i paths share it).
-    /// Call once after construction; the adapter stays for the pipeline's lifetime.
-    @discardableResult
-    public func applyLoRA(loRAs: [(url: URL, strength: Float)]) throws -> MageLoRA.AppliedSummary {
-        try MageLoRA.apply(loRAs: loRAs, to: transformer, dtype: ditDtype)
-    }
-}

@@ -49,6 +49,29 @@ public struct MageRefImage: Sendable {
     }
 }
 
+/// What the conditioner hands the DiT for one generation: the Qwen3-VL features and, under CFG,
+/// their negative — evaluated float32, a few MB, so a batch can hold every job's while the
+/// conditioner is out of memory.
+public struct MageConditioning {
+    public let feats: MLXArray
+    public let negFeats: MLXArray?
+    public init(feats: MLXArray, negFeats: MLXArray?) {
+        self.feats = feats; self.negFeats = negFeats
+    }
+}
+
+/// One edit of a batch (`MageFlowEditPipeline.editBatch`): its references in prompt order and
+/// its own seed, square side (/16-floored) and start sigma (nil = from noise).
+public struct MageEditJob: Sendable {
+    public var refs: [MageRefImage]
+    public var seed: UInt64
+    public var size: Int
+    public var initSigma: Float?
+    public init(refs: [MageRefImage], seed: UInt64, size: Int, initSigma: Float? = nil) {
+        self.refs = refs; self.seed = seed; self.size = size; self.initSigma = initSigma
+    }
+}
+
 public struct MageFlowEditConfig {
     /// Upstream's validated multi-reference range: trained with up to 3 refs
     /// (`generate_edits` docstring — "trained with up to 3, but more are accepted").
@@ -108,71 +131,64 @@ public final class MageFlowEditPipeline {
     let textEncoderDir: URL
     let tokenizer: Tokenizers.Tokenizer
     let imageProcessor: Qwen3VLImageProcessor
-    let transformer: MageFlowTransformer
+    /// The NR-MMDiT (int8 5.6 / bf16 7.7 GB). Evictable like the conditioner: `dropTransformer()`
+    /// releases it, `dit()` reloads it (re-applying any LoRA), so the two never have to share memory.
+    private var ditModel: MageFlowTransformer?
+    let transformerDir: URL
+    let ditQuant: URL?
+    /// Adapters re-applied on every DiT load (`applyLoRA`).
+    private var loRAs: [(url: URL, strength: Float)] = []
     let vae: VAEWeights
     /// Mutable so an engine wrapper can apply per-request overrides (steps/size/seed/cfg).
     public var cfg: MageFlowEditConfig
     let ditDtype: DType
+    /// How many times this pipeline has loaded the conditioner / the DiT (the light tiers reload
+    /// them per request; a tiles batch loads each once).
+    public private(set) var conditionerLoads = 0
+    public private(set) var transformerLoads = 0
+    /// Wall time spent in those loads (both loaders evaluate eagerly), for receipts.
+    public private(set) var conditionerLoadSeconds = 0.0
+    public private(set) var transformerLoadSeconds = 0.0
 
     public init(
         textEncoderDir: URL, transformerDir: URL, vaeSafetensors: URL, foldedAdaLN: URL,
         ditQuant: URL? = nil,
         cfg: MageFlowEditConfig = MageFlowEditConfig(),
-        deferConditioner: Bool = false
+        deferConditioner: Bool = false,
+        deferTransformer: Bool = false
     ) async throws {
         self.cfg = cfg
         self.textEncoderDir = textEncoderDir
-        // load everything on the CPU stream; heavy reads shouldn't ride a GPU buffer
-        if deferConditioner {
-            self.vlModel = nil   // loaded lazily by conditioner() on first encode
-        } else {
-            self.vlModel = try Device.withDefaultDevice(.cpu) {
-                try Qwen3VLLoader.load(directory: textEncoderDir, dtype: .bfloat16)
-            }
-        }
+        self.transformerDir = transformerDir
+        self.ditQuant = ditQuant
+        // bf16 by default (upstream dtype). The former "grid garbage at >=512^2"
+        // was root-caused to the mlx-swift <=0.31.6 JIT-miscompiled NAX split-K
+        // GEMM (ml-explore/mlx#3797, fixed by #3810) hitting the FFN proj_out at
+        // >=1366 image tokens; mlx-swift 0.32.3 (the manifest floor) carries the fix.
+        // MAGEFLOW_FP32 remains for parity work. A pre-quantized DiT keeps its unquantized layers bf16.
+        self.ditDtype = ditQuant == nil && ProcessInfo.processInfo.environment["MAGEFLOW_FP32"] != nil
+            ? .float32 : .bfloat16
         self.tokenizer = try await AutoTokenizer.from(modelFolder: textEncoderDir)
         self.imageProcessor = Qwen3VLImageProcessor()
-
-        if let ditQuant {
-            // pre-quantized DiT (int4/int8): no bf16 peak; unquantized layers stay bf16
-            self.transformer = try MageQuant.loadQuantizedDiT(from: ditQuant)
-            self.ditDtype = .bfloat16
-        } else {
-            let model = MageFlowTransformer()
-            var raw: [String: MLXArray] = [:]
-            for f in try FileManager.default.contentsOfDirectory(
-                at: transformerDir, includingPropertiesForKeys: nil
-            ).filter({ $0.pathExtension == "safetensors" }) {
-                raw.merge(try MLX.loadArrays(url: f)) { x, _ in x }
-            }
-            let keys = Set(model.parameters().flattened().map(\.0))
-            // bf16 by default (upstream dtype). The former "grid garbage at >=512^2"
-            // was root-caused to the mlx-swift <=0.31.6 JIT-miscompiled NAX split-K
-            // GEMM (ml-explore/mlx#3797, fixed by #3810) hitting the FFN proj_out at
-            // >=1366 image tokens; mlx-swift 0.32.3 (the manifest floor) carries the fix.
-            // MAGEFLOW_FP32 remains for parity work.
-            let ditDtype: DType = ProcessInfo.processInfo.environment["MAGEFLOW_FP32"] != nil ? .float32 : .bfloat16
-            let w = model.sanitize(weights: raw).mapValues { $0.asType(ditDtype) }
-            let missing = keys.subtracting(Set(w.keys))
-            guard missing.isEmpty else { throw MageFlowEditError.load("DiT missing \(missing.count) keys") }
-            model.update(parameters: ModuleParameters.unflattened(w.filter { keys.contains($0.key) }))
-            eval(model)
-            self.transformer = model
-            self.ditDtype = ditDtype
-        }
-
         self.vae = try MageVAELoader.load(vae: vaeSafetensors, foldedAdaLN: foldedAdaLN)
+        // deferred models load lazily on first use (conditioner() / dit())
+        if !deferConditioner { _ = try conditioner() }
+        if !deferTransformer { _ = try dit() }
     }
 
-    // MARK: conditioner lifecycle (light tier)
+    // MARK: model lifecycle (light tiers)
 
     /// The VL conditioner, loading it on demand if evicted/deferred.
     func conditioner() throws -> Qwen3VL {
         if let vlModel { return vlModel }
+        let start = Date()
+        // load on the CPU stream; heavy reads shouldn't ride a GPU buffer
         let loaded: Qwen3VL = try Device.withDefaultDevice(.cpu) {
             try Qwen3VLLoader.load(directory: textEncoderDir, dtype: .bfloat16)
         }
         vlModel = loaded
+        conditionerLoads += 1
+        conditionerLoadSeconds += Date().timeIntervalSince(start)
         return loaded
     }
 
@@ -181,6 +197,55 @@ public final class MageFlowEditPipeline {
     public func dropConditioner() {
         vlModel = nil
         MLX.Memory.clearCache()
+    }
+
+    /// Whether the conditioner / the DiT is in memory now.
+    public var conditionerResident: Bool { vlModel != nil }
+    public var transformerResident: Bool { ditModel != nil }
+
+    /// The DiT, loading it on demand if evicted/deferred (any LoRA is re-applied).
+    func dit() throws -> MageFlowTransformer {
+        if let ditModel { return ditModel }
+        let start = Date()
+        let model: MageFlowTransformer
+        if let ditQuant {
+            // pre-quantized DiT (int4/int8): no bf16 peak
+            model = try MageQuant.loadQuantizedDiT(from: ditQuant)
+        } else {
+            model = MageFlowTransformer()
+            var raw: [String: MLXArray] = [:]
+            for f in try FileManager.default.contentsOfDirectory(
+                at: transformerDir, includingPropertiesForKeys: nil
+            ).filter({ $0.pathExtension == "safetensors" }) {
+                raw.merge(try MLX.loadArrays(url: f)) { x, _ in x }
+            }
+            let keys = Set(model.parameters().flattened().map(\.0))
+            let w = model.sanitize(weights: raw).mapValues { $0.asType(ditDtype) }
+            let missing = keys.subtracting(Set(w.keys))
+            guard missing.isEmpty else { throw MageFlowEditError.load("DiT missing \(missing.count) keys") }
+            model.update(parameters: ModuleParameters.unflattened(w.filter { keys.contains($0.key) }))
+            eval(model)
+        }
+        if !loRAs.isEmpty { try MageLoRA.apply(loRAs: loRAs, to: model, dtype: ditDtype) }
+        ditModel = model
+        transformerLoads += 1
+        transformerLoadSeconds += Date().timeIntervalSince(start)
+        return model
+    }
+
+    /// Release the DiT (it reloads, with its LoRA, on the next denoise).
+    public func dropTransformer() {
+        ditModel = nil
+        MLX.Memory.clearCache()
+    }
+
+    /// Apply LoRA adapter(s) to the DiT (edit AND t2i paths share it), loading it if it is
+    /// evicted. The adapters stay for the pipeline's lifetime and are re-applied on every reload.
+    @discardableResult
+    public func applyLoRA(loRAs new: [(url: URL, strength: Float)]) throws -> MageLoRA.AppliedSummary {
+        let summary = try MageLoRA.apply(loRAs: new, to: try dit(), dtype: ditDtype)
+        loRAs += new
+        return summary
     }
 
     // MARK: image helpers
@@ -227,11 +292,20 @@ public final class MageFlowEditPipeline {
 
     /// Encode NHWC [1,H,W,3] in [-1,1] → (PNG bytes, width, height) — the engine surface.
     public static func encodePNG(_ nhwc: MLXArray) throws -> (Data, Int, Int) {
+        let (rgb, W, H) = rgb8(nhwc)
+        return (try encodePNG(rgb: rgb, width: W, height: H), W, H)
+    }
+
+    /// NHWC [1,H,W,3] in [-1,1] → (RGB8, width, height): the engine surface's quantization.
+    public static func rgb8(_ nhwc: MLXArray) -> ([UInt8], Int, Int) {
         let x = clip(nhwc[0], min: -1, max: 1)
         let u = ((x + 1) * 127.5).asType(.uint8)
         eval(u)
-        let (H, W) = (u.dim(0), u.dim(1))
-        let rgb = u.asArray(UInt8.self)
+        return (u.asArray(UInt8.self), u.dim(1), u.dim(0))
+    }
+
+    /// Tightly-packed RGB8 → PNG bytes.
+    public static func encodePNG(rgb: [UInt8], width W: Int, height H: Int) throws -> Data {
         var rgba = [UInt8](repeating: 255, count: H * W * 4)
         for i in 0 ..< H * W { for c in 0 ..< 3 { rgba[i * 4 + c] = rgb[i * 3 + c] } }
         guard let cg = CGContext(data: &rgba, width: W, height: H, bitsPerComponent: 8,
@@ -243,7 +317,7 @@ public final class MageFlowEditPipeline {
         else { throw MageFlowEditError.load("PNG encode") }
         CGImageDestinationAddImage(dst, cg, nil)
         guard CGImageDestinationFinalize(dst) else { throw MageFlowEditError.load("PNG finalize") }
-        return (out as Data, W, H)
+        return out as Data
     }
 
     public static func savePNG(_ nhwc: MLXArray, to url: URL) {
@@ -331,18 +405,32 @@ public final class MageFlowEditPipeline {
     /// Text-to-image (Mage-Flow / -Base / -Turbo). Returns NHWC [1,H,W,3] in [-1,1].
     public func t2i(prompt: String, screen: Bool = true,
                     shouldStop: (() -> Bool)? = nil) throws -> MLXArray {
+        try t2iRender(try t2iConditioning(prompt: prompt, screen: screen, shouldStop: shouldStop),
+                      shouldStop: shouldStop)
+    }
+
+    /// The conditioner's half of `t2i`: the content filter and the prompt encodes (the only
+    /// part that needs Qwen3-VL in memory).
+    public func t2iConditioning(prompt: String, screen: Bool = true,
+                                shouldStop: (() -> Bool)? = nil) throws -> MageConditioning {
         if screen {
             MageProgress.report(.screen)
             try screenT2I(prompt)
         }
         if shouldStop?() == true { throw CancellationError() }   // post-screen seam
-        let side = (cfg.size / 16) * 16
-        let (lh, lw) = (side / 16, side / 16)
-
         MageProgress.report(.encode)
         let feats = try encodeT2I(prompt)
         let useCFG = cfg.cfg > 1.0 && !cfg.negPrompt.isEmpty
         let negFeats = useCFG ? try encodeT2I(cfg.negPrompt) : nil
+        return MageConditioning(feats: feats, negFeats: negFeats)
+    }
+
+    /// The DiT's half of `t2i` at `cfg`'s size, seed and steps: denoise and decode.
+    public func t2iRender(_ conditioning: MageConditioning,
+                          shouldStop: (() -> Bool)? = nil) throws -> MLXArray {
+        let side = (cfg.size / 16) * 16
+        let (lh, lw) = (side / 16, side / 16)
+        let (feats, negFeats) = (conditioning.feats, conditioning.negFeats)
 
         let noise = gaussianShadingNoise(
             channels: 128, height: lh, width: lw, key: cfg.gsKey, seed: cfg.seed)
@@ -350,7 +438,7 @@ public final class MageFlowEditPipeline {
             .reshaped(1, lh * lw, 128).asType(ditDtype)
 
         let sched = FlowMatchEulerScheduler(steps: cfg.steps, shift: cfg.shift)
-        let pipe = MageFlowPipeline(transformer: transformer)
+        let pipe = MageFlowPipeline(transformer: try dit())
         // whole sequence is the target; single shape entry, frame idx 0
         let out = pipe.denoise(
             img: img0, txt: feats.asType(ditDtype), targetLen: lh * lw,
@@ -399,12 +487,25 @@ public final class MageFlowEditPipeline {
     /// at that size, exactly as upstream does once the size is fixed).
     public func edit(refs: [MageRefImage], instruction: String, screen: Bool = true,
                      shouldStop: (() -> Bool)? = nil) throws -> MLXArray {
+        try editRender(refs: refs, try editConditioning(refs: refs, instruction: instruction, screen: screen,
+                                                        shouldStop: shouldStop),
+                       shouldStop: shouldStop)
+    }
+
+    static func checkReferences(_ refs: [MageRefImage]) throws {
         guard !refs.isEmpty else { throw MageFlowEditError.load("edit needs at least one reference image") }
         guard refs.count <= MageFlowEditConfig.maxReferences else {
             throw MageFlowEditError.load(
                 "\(refs.count) reference images — the trained/validated range is 1…\(MageFlowEditConfig.maxReferences)")
         }
-        let side = (cfg.size / 16) * 16
+    }
+
+    /// The conditioner's half of `edit` (steps 1–3): the content filter over the references and
+    /// the instruction, then the Qwen3-VL conditioning (and its negative under CFG) — the only
+    /// part that needs Qwen3-VL in memory. Independent of `cfg`'s size, seed and start sigma.
+    public func editConditioning(refs: [MageRefImage], instruction: String, screen: Bool = true,
+                                 shouldStop: (() -> Bool)? = nil) throws -> MageConditioning {
+        try Self.checkReferences(refs)
         let n = refs.count
 
         // --- VL conditioning images at 384px long edge --------------------
@@ -515,6 +616,18 @@ public final class MageFlowEditPipeline {
         // negative instruction (upstream: edit_refs + edit_refs, pos + neg).
         let useCFG = cfg.cfg > 1.0 && !cfg.negPrompt.isEmpty
         let negFeats = useCFG ? try encodeEdit(cfg.negPrompt) : nil
+        return MageConditioning(feats: feats, negFeats: negFeats)
+    }
+
+    /// The DiT's half of `edit` (steps 4–7) at `cfg`'s size, seed and start sigma: the reference
+    /// latents, the watermarked start, the denoise and the decode. `refs` are the ones the
+    /// conditioning was made from.
+    public func editRender(refs: [MageRefImage], _ conditioning: MageConditioning,
+                           shouldStop: (() -> Bool)? = nil) throws -> MLXArray {
+        try Self.checkReferences(refs)
+        let side = (cfg.size / 16) * 16
+        let n = refs.count
+        let (feats, negFeats) = (conditioning.feats, conditioning.negFeats)
 
         // --- ref latents (every ref at the full target resolution) --------
         var refLatents: [MLXArray] = []
@@ -548,7 +661,7 @@ public final class MageFlowEditPipeline {
             axis: 1).asType(ditDtype)
         let shapes = Array(repeating: (frame: 1, height: lh, width: lw), count: n + 1)
         let sched = FlowMatchEulerScheduler(steps: cfg.steps, shift: cfg.shift, startSigma: startSigma)
-        let pipe = MageFlowPipeline(transformer: transformer)
+        let pipe = MageFlowPipeline(transformer: try dit())
         let out = pipe.denoise(img: packed, txt: feats.asType(ditDtype),
                                targetLen: lh * lw, imgShapes: shapes, scheduler: sched,
                                negTxt: negFeats.map { $0.asType(ditDtype) }, cfg: cfg.cfg,
@@ -562,5 +675,43 @@ public final class MageFlowEditPipeline {
         let img = vaeDecode(targetLatent, vae)
         eval(img)
         return img
+    }
+
+    // MARK: batches (tiles)
+
+    /// Several independent edits with one instruction, in two passes: every job's conditioning
+    /// (one conditioner load for the whole batch), then every job's denoise and decode — with
+    /// `releaseConditioner`, after the conditioner has left memory, so it and the DiT never have
+    /// to share it. Each job keeps its own references, seed, size and start sigma: job k's output
+    /// is the one `edit` makes alone with them (the creative upscale's tiles, G-5). Progress is
+    /// reported with `stage` k + 1 of `jobs.count` in both passes. `onOutput` receives each
+    /// decoded NHWC image in job order, before the next job allocates. `cfg` is restored after.
+    public func editBatch(_ jobs: [MageEditJob], instruction: String, screen: Bool = true,
+                          releaseConditioner: Bool = false,
+                          shouldStop: (() -> Bool)? = nil,
+                          onOutput: (Int, MLXArray) throws -> Void) throws {
+        for job in jobs { try Self.checkReferences(job.refs) }
+        var conditionings: [MageConditioning] = []
+        conditionings.reserveCapacity(jobs.count)
+        for (k, job) in jobs.enumerated() {
+            if shouldStop?() == true { throw CancellationError() }
+            let c = try MageProgress.$stage.withValue((k + 1, jobs.count)) {
+                try editConditioning(refs: job.refs, instruction: instruction, screen: screen, shouldStop: shouldStop)
+            }
+            conditionings.append(c)
+        }
+        if releaseConditioner { dropConditioner() }
+        let base = cfg
+        defer { cfg = base }
+        for (k, job) in jobs.enumerated() {
+            if shouldStop?() == true { throw CancellationError() }
+            cfg.size = job.size
+            cfg.seed = job.seed
+            cfg.initSigma = job.initSigma
+            let img = try MageProgress.$stage.withValue((k + 1, jobs.count)) {
+                try editRender(refs: job.refs, conditionings[k], shouldStop: shouldStop)
+            }
+            try onOutput(k, img)
+        }
     }
 }

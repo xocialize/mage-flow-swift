@@ -34,18 +34,23 @@ public enum MageProgress {
         case decode
     }
 
-    /// One coarse observation: the phase, plus 1-based step counts when the phase has steps.
-    /// Mage has a single denoise stage, so the contract's `stage`/`totalStages` have nothing to
-    /// carry here; they can ride in additively if a staged path ever lands.
+    /// One coarse observation: the phase, plus 1-based step counts when the phase has steps, and
+    /// a 1-based stage when one call runs the phases several times (a batch of edits — tiles —
+    /// reports job k as stage k of the batch, the contract's `stage`/`totalStages`).
     public struct Event: Sendable, Equatable {
         public var phase: Phase
         public var step: Int?
         public var totalSteps: Int?
+        public var stage: Int?
+        public var totalStages: Int?
 
-        public init(phase: Phase, step: Int? = nil, totalSteps: Int? = nil) {
+        public init(phase: Phase, step: Int? = nil, totalSteps: Int? = nil,
+                    stage: Int? = nil, totalStages: Int? = nil) {
             self.phase = phase
             self.step = step
             self.totalSteps = totalSteps
+            self.stage = stage
+            self.totalStages = totalStages
         }
     }
 
@@ -53,10 +58,15 @@ public enum MageProgress {
 
     @TaskLocal public static var sink: Sink?
 
+    /// The (stage, totalStages) every report in scope carries — bound around each job of a batch.
+    @TaskLocal public static var stage: (Int, Int)?
+
     /// Report a phase observation to the ambient sink (no-op if none is bound). Public because
     /// the reporting sites span both core targets (MageFlow's denoise loop, MageFlowEdit's
     /// pipeline seams).
     public static func report(_ phase: Phase, step: Int? = nil, totalSteps: Int? = nil) {
-        sink?(Event(phase: phase, step: step, totalSteps: totalSteps))
+        guard let sink else { return }
+        let s = stage
+        sink(Event(phase: phase, step: step, totalSteps: totalSteps, stage: s?.0, totalStages: s?.1))
     }
 }

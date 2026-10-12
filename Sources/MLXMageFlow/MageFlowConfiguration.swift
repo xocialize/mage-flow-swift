@@ -69,10 +69,18 @@ public struct MageFlowConfiguration: PackageConfiguration, ModelStorable, QuantC
     /// Default square output side (Mage is native-resolution but the port's validated
     /// envelope is square 512–2048; /16-floored).
     public var defaultSize: Int
-    /// Light tier: drop the ~8.3 GB Qwen3-VL conditioner after each request's encode
-    /// (it reloads on the next request) — resident set becomes DiT + VAE, so the
-    /// low-RAM peak ≈ max(encode, denoise) instead of conditioner + denoise.
+    /// Light tier: drop the ~8.3 GB Qwen3-VL conditioner after each request's encode, before
+    /// the denoise (it reloads on the next request) — resident set becomes DiT + VAE, and the
+    /// peak is the encode (DiT + VAE + conditioner) instead of conditioner + denoise.
     public var evictConditioner: Bool
+    /// Lightest tier (16 GB Macs; implies `evictConditioner`): the DiT is out of memory too
+    /// whenever the conditioner is in — it loads after the encode and leaves after the request —
+    /// so the two never share memory. Peak ≈ max(conditioner + VAE + encode, DiT + VAE +
+    /// denoise); resident between requests ≈ VAE + tokenizer. Costs one DiT load per request
+    /// (int8 5.6 GB): pair it with the `tiles` mode, which loads each model once for N tiles.
+    public var evictTransformer: Bool
+    /// The light tiers: the conditioner leaves memory after each encode, before the denoise.
+    public var dropsConditioner: Bool { evictConditioner || evictTransformer }
     /// Bypass the mandatory Responsible-AI content filter (parity with the CLI's
     /// `--no-filter`). Default false — the fail-closed screen runs. When true the
     /// `screen` step is skipped entirely; intended for local development/testing.
@@ -93,6 +101,7 @@ public struct MageFlowConfiguration: PackageConfiguration, ModelStorable, QuantC
         guidanceScale: Float? = nil,
         defaultSize: Int = 1024,
         evictConditioner: Bool = false,
+        evictTransformer: Bool = false,
         bypassContentFilter: Bool = false,
         loraPath: String? = nil,
         loraStrength: Float = 1.0,
@@ -105,6 +114,7 @@ public struct MageFlowConfiguration: PackageConfiguration, ModelStorable, QuantC
         self.guidanceScale = guidanceScale ?? variant.defaultGuidance
         self.defaultSize = defaultSize
         self.evictConditioner = evictConditioner
+        self.evictTransformer = evictTransformer
         self.bypassContentFilter = bypassContentFilter
         self.loraPath = loraPath
         self.loraStrength = loraStrength
@@ -113,7 +123,7 @@ public struct MageFlowConfiguration: PackageConfiguration, ModelStorable, QuantC
 
     private enum CodingKeys: String, CodingKey {
         case variant, quant, defaultSteps, guidanceScale, defaultSize, evictConditioner
-        case bypassContentFilter
+        case evictTransformer, bypassContentFilter
     }
 
     public init(from decoder: Decoder) throws {
@@ -125,6 +135,7 @@ public struct MageFlowConfiguration: PackageConfiguration, ModelStorable, QuantC
         guidanceScale = try c.decodeIfPresent(Float.self, forKey: .guidanceScale) ?? v.defaultGuidance
         defaultSize = try c.decodeIfPresent(Int.self, forKey: .defaultSize) ?? 1024
         evictConditioner = try c.decodeIfPresent(Bool.self, forKey: .evictConditioner) ?? false
+        evictTransformer = try c.decodeIfPresent(Bool.self, forKey: .evictTransformer) ?? false
         bypassContentFilter = try c.decodeIfPresent(Bool.self, forKey: .bypassContentFilter) ?? false
         loraPath = nil          // env-specific runtime override; not persisted
         loraStrength = 1.0
@@ -142,27 +153,41 @@ public struct MageFlowConfiguration: PackageConfiguration, ModelStorable, QuantC
     // MARK: FootprintConfigured
     //
     // Static QuantFootprints declare the resident-conditioner path at the 1024²
-    // envelope. The hints surface the two dynamic levers:
+    // envelope. The hints surface the dynamic levers:
     //  - evictConditioner drops the ~8.3 GB Qwen3-VL from the resident set;
+    //  - evictTransformer also keeps the DiT out while the conditioner is in, and out between
+    //    requests: resident ≈ VAE + tokenizer, the peak the larger of the two phases;
     //  - activation scales ~with latent token count ((size/16)² tokens; measured
     //    2.2 GB @512² → 3.7 GB @1024² → 8.8 GB @2048², edit path ≈ 2× tokens).
-    public var residentBytesHint: UInt64? {
-        guard evictConditioner else { return nil }
-        // DiT (per tier: bf16 7.7 / int8-g32 5.6 / int4 4.3 GB) + VAE floor;
-        // the conditioner is transient.
+
+    /// The DiT tier's weights (bf16 7.7 / int8-g32 5.6 / int4 4.3 GB).
+    var ditBytes: UInt64 {
         switch quant {
-        case .int8: return 6_000_000_000
-        case .int4: return 4_700_000_000
-        default: return 8_100_000_000
+        case .int8: return 5_600_000_000
+        case .int4: return 4_300_000_000
+        default: return 7_700_000_000
         }
+    }
+
+    public var residentBytesHint: UInt64? {
+        if evictTransformer { return 400_000_000 }   // MageVAE + tokenizer; both models are transient
+        guard evictConditioner else { return nil }
+        // DiT + VAE floor; the conditioner is transient.
+        return ditBytes + 400_000_000
     }
     public var peakActivationBytesHint: UInt64? {
         let tokens = Double(defaultSize / 16) * Double(defaultSize / 16)
         let scale = tokens / 4096.0   // measured baseline is the 1024² grid (64×64)
-        let base = 3_700_000_000.0 * max(scale, 0.25)
-        // evict mode: the transient conditioner encode (~8.3 GB weights + small
-        // activation) becomes part of the activation envelope.
-        return UInt64(evictConditioner ? Swift.max(base, 9_000_000_000) : base)
+        let base = UInt64(3_700_000_000.0 * max(scale, 0.25))
+        // the conditioner phase: its weights plus the encode activation (measured 10.3 GB MLX peak with the VAE
+        // resident, int8 Turbo, size-independent: the conditioner sees a 384 px view)
+        let encode: UInt64 = 10_000_000_000
+        if evictTransformer {
+            // the two phases never overlap: whichever loads more
+            return Swift.max(encode, ditBytes + base)
+        }
+        // evict mode: the transient conditioner encode becomes part of the activation envelope.
+        return evictConditioner ? Swift.max(base, encode) : base
     }
 }
 
