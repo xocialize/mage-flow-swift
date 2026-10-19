@@ -222,3 +222,61 @@ public enum MageLoRA {
         try apply(loRAs: [(url, strength)], to: model, dtype: dtype)
     }
 }
+
+/// Stateful adapter swapper for a resident Mage DiT (per-request adapters, contract 1.53.0,
+/// AB-A-0192): `set(_:)` restores the pristine base modules, captured on first use, then applies the
+/// new set. `LoRALinear` shares the base weight by reference, so neither the capture nor a swap
+/// copies base weights. The files are read and checked before the model is touched, so an adapter
+/// that doesn't land throws with the previous set still applied. Klein's `KleinLoRASwapper`,
+/// Mage-typed. Not thread-safe; drive it from the actor that owns the DiT.
+public final class MageLoRASwapper {
+    private let model: MageFlowTransformer
+    private let dtype: DType
+    /// full `transformer_blocks.<i>.<rel>` path -> pristine base module (Linear/QuantizedLinear).
+    private var pristine: [String: Module] = [:]
+    /// block-relative keys currently realized as a LoRALinear.
+    private var applied: Set<String> = []
+
+    public init(model: MageFlowTransformer, dtype: DType = .bfloat16) {
+        self.model = model
+        self.dtype = dtype
+    }
+
+    /// The block-relative keys currently adapted (empty = pure base).
+    public var activeKeys: Set<String> { applied }
+
+    /// Make `loras` the active set. An empty array leaves the pristine base in place.
+    @discardableResult
+    public func set(_ loras: [(url: URL, strength: Float)]) throws -> MageLoRA.AppliedSummary {
+        let combined = loras.isEmpty ? nil : try MageLoRA.combined(loras, dtype: dtype)
+        detach()
+        guard let (params, ranks, targetKeys) = combined else {
+            return MageLoRA.AppliedSummary(bf16Targets: 0, quantizedTargets: 0)
+        }
+        applied = targetKeys   // recorded first, so a failure part-way still detaches cleanly
+        var bf16 = 0, quant = 0
+        for (i, block) in model.transformerBlocks.enumerated() {
+            var update: [(String, Module)] = []
+            for (key, child) in block.namedModules() where targetKeys.contains(key) {
+                let path = "transformer_blocks.\(i).\(key)"
+                guard let linear = child as? Linear, let rank = ranks[path] else { continue }
+                pristine[path] = pristine[path] ?? linear
+                if linear is QuantizedLinear { quant += 1 } else { bf16 += 1 }
+                update.append((key, LoRALinear.from(linear: linear, rank: rank, scale: 1.0)))
+            }
+            if !update.isEmpty { block.update(modules: .unflattened(update)) }
+        }
+        try model.update(parameters: ModuleParameters.unflattened(params), verify: .noUnusedKeys)
+        return MageLoRA.AppliedSummary(bf16Targets: bf16, quantizedTargets: quant)
+    }
+
+    /// Restore the pristine base in every currently-adapted target.
+    public func detach() {
+        guard !applied.isEmpty else { return }
+        for (i, block) in model.transformerBlocks.enumerated() {
+            let restore = applied.compactMap { key in pristine["transformer_blocks.\(i).\(key)"].map { (key, $0) } }
+            if !restore.isEmpty { block.update(modules: .unflattened(restore)) }
+        }
+        applied = []
+    }
+}

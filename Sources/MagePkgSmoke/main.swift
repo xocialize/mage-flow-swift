@@ -36,6 +36,40 @@ if args.first == "probe-dl", args.count >= 3 {
     exit(0)
 }
 
+// adapters <modelsRoot> <ref.png> <zero.safetensors> <synthetic.safetensors> [quant] — the per-request
+// adapter gate (contract 1.53.0, AB-A-0192), on one resident Edit Turbo package, seed 42, 512²:
+//   base == zero-delta adapter (bit-exact), synthetic != base, base again == base (detach restores).
+// The adapters (`mage-lora-smoke synth` writes both) reach run() as the engine hands them over.
+if args.first == "adapters", args.count >= 5 {
+    let quant: Quant = args.count > 5 ? (args[5] == "int8" ? .int8 : args[5] == "int4" ? .int4 : .bf16) : .int8
+    let ref = Image(format: .png, data: try Data(contentsOf: URL(fileURLWithPath: args[2])), width: 0, height: 0)
+    func adapter(_ path: String) -> ResolvedAdapter {
+        ResolvedAdapter(id: URL(fileURLWithPath: path).lastPathComponent, kind: .plain, format: .diffusersPEFT,
+                        fileURL: URL(fileURLWithPath: path),
+                        source: AdapterSource(repo: "local/synthetic", revision: String(repeating: "0", count: 40),
+                                              file: path, sha256: String(repeating: "0", count: 63) + "\(path.count % 10)"),
+                        strength: 1, footprint: AdapterFootprint(residentBytes: 0))
+    }
+    let package = try MageFlowEditPackage.registration.makePackage(
+        MageFlowConfiguration(variant: .editTurbo, quant: quant, defaultSize: 512,
+                              modelsRootDirectory: URL(fileURLWithPath: args[1])))
+    try await package.load()
+    func edit(_ adapters: [ResolvedAdapter]) async throws -> Data {
+        let r = try await package.run(IEditRequest(images: [ref], prompt: "make the background a snowy forest", seed: 42)
+            .resolving(adapters)) as! IEditResponse
+        return r.image.data
+    }
+    let base = try await edit([])
+    let zero = try await edit([adapter(args[3])])
+    let synth = try await edit([adapter(args[4])])
+    let again = try await edit([])
+    func check(_ ok: Bool, _ what: String) { print("[adapters] \(ok ? "PASS" : "FAIL") \(what)"); if !ok { exit(1) } }
+    check(base == zero, "a zero-delta adapter renders bit-identical to the base (\(quant))")
+    check(synth != base, "a random adapter changes the render")
+    check(again == base, "the next request without adapters is bit-identical to the first (detach restores the base)")
+    exit(0)
+}
+
 guard args.count >= 2 else { die("usage: mage-pkg-smoke <snapshotRoot> t2i|edit [ref.png] [quant] [out.png]") }
 let root = args[0], surface = args[1]
 let refPath = args.count > 2 ? args[2] : nil

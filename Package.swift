@@ -29,7 +29,7 @@ let package = Package(
         .package(url: "https://github.com/ml-explore/mlx-swift-lm.git", from: "3.32.3"),
         // ≥0.32.0 for engine-executed first-run materialization (contract 1.24.0);
         // the package no longer carries its own WeightMaterializer.
-        .package(url: "https://github.com/xocialize/mlx-engine-swift", from: "0.32.0"),
+        .package(url: "https://github.com/xocialize/mlx-engine-swift", from: "0.68.0"),   // ≥0.68.0: typed adapters (contract 1.53.0)
         .package(url: "https://github.com/xocialize/mlx-profiling.git", from: "0.1.0"),
         // ≥0.1.1: 0.1.0's exact conv reached an mlx channel-pad helper that frees its zero fill value
         // mid-flight; under a capped MLX cache that killed the host with a Metal "Invalid Resource"

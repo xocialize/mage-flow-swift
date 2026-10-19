@@ -110,6 +110,26 @@ case "synth":
         gate(keys == ["diffusion_model.transformer_blocks.0.attn.to_qkv"], "unknown key rejected loudly: \(keys)")
     }
 
+    // Per-request adapters (AB-A-0192): the swapper attaches, restores the base, and refuses a
+    // bad adapter without disturbing the set already applied.
+    let dit = freshDiT(int8: true)
+    let swapper = MageLoRASwapper(model: dit)
+    func adapted() -> Int {
+        dit.transformerBlocks.reduce(0) { n, block in n + block.namedModules().filter { $0.1 is LoRALayer }.count }
+    }
+    let sw = try swapper.set([(synthURL, 1.0)])
+    gate(sw.total == expected && adapted() == expected, "swapper: \(expected) targets attached on int8")
+    try swapper.set([])
+    gate(adapted() == 0, "swapper: an empty set restores the pristine base")
+    try swapper.set([(synthURL, 0.5), (zeroURL, 1.0)])
+    gate(adapted() == expected, "swapper: two adapters rank-stack onto the same \(expected) targets")
+    do {
+        try swapper.set([(badURL, 1.0)])
+        gate(false, "swapper: an unknown key must be rejected")
+    } catch MageLoRA.LoRAError.unknownKeys {
+        gate(adapted() == expected, "swapper: a rejected adapter leaves the applied set in place")
+    }
+
 case "apply":
     guard args.count >= 2 else { die("apply needs <lora.safetensors>") }
     let url = URL(fileURLWithPath: args[1])

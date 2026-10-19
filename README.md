@@ -136,7 +136,35 @@ each extra reference adds one clean latent (≈ +2 % at 1024²), well inside the
 1024² envelope. 4-step Turbo composes three references without collapsing (the
 consumer's "if Turbo multi-ref turns out weak" question): see the gate renders.
 
+## Typed per-request adapters — v0.12.0, AB-A-0192
+
+Both packages take **adapters per request** (mlx-engine contract 1.53.0). A request names adapters by catalog id
+(`T2IRequest` / `IEditRequest.adapters`). The engine resolves them, fetches and sha256-checks the files, and hands the
+package `resolvedAdapters`. The pipeline swaps them onto the resident DiT (`MageLoRASwapper`: restore the pristine base,
+then rank-stack the new set), and changes the stack only when the next request's set differs.
+
+| Surface | `AdapterSupport` |
+|---|---|
+| `mage-flow-t2i` | base `mage-flow` (the t2i checkpoints); format `diffusers-peft`; kinds `plain`; up to 4; strength 0…2; every quant; per request |
+| `mage-flow-edit` | base `mage-flow-edit` (the edit checkpoints); the same, plus kind `ic` |
+
+- **IC adapters** (a RefControl-style pose adapter on Mage-Flow-Edit-Base): the conditioning images arrive in slot
+  order and lead the references, followed by the request's own images, within the 1…3 trained range. One IC adapter
+  per request. IC is refused on text-to-image and in the `tiles` mode, where each tile is Image 1 of its own edit.
+- **The light tiers:** the set is re-applied whenever the evicted DiT reloads (`MageFlowEditPipeline.setLoRAs`).
+- **`loraPath` / `loraStrength` are deprecated,** kept for apps built around one local adapter (LTX Studio's
+  model-sheet pose lane). That adapter is applied at load and stays under every request's set.
+- **Gates:**
+  - `mage-lora-smoke synth` on an int8 config-dims DiT: the swapper attaches 144 targets; an empty set restores the
+    base; two adapters rank-stack onto the same 144; a rejected adapter leaves the applied set in place.
+  - `mage-pkg-smoke adapters <modelsRoot> <ref.png> <zero> <synthetic> [quant]` on real Edit Turbo weights (int8,
+    512², seed 42): a zero-delta adapter renders bit-identical to the base; a random one changes the render; the next
+    request without adapters is bit-identical to the first.
+  - `AdapterTests`: ADP-1..4 over both manifests.
+
 ## Runtime DiT-LoRA (1…N adapters) — v0.7.0, AB-A-0050
+
+Superseded by the per-request adapters above; the load-time path below remains as the deprecated `loraPath`.
 
 `MageFlowConfiguration.loraPath` (+ `loraStrength`, default 1.0) applies a local safetensors
 adapter to the resident DiT in `load()`, as an **activation-path** term (`LoRALinear` /

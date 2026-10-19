@@ -85,8 +85,10 @@ public struct MageFlowConfiguration: PackageConfiguration, ModelStorable, QuantC
     /// `--no-filter`). Default false — the fail-closed screen runs. When true the
     /// `screen` step is skipped entirely; intended for local development/testing.
     public var bypassContentFilter: Bool
-    /// Runtime DiT-LoRA (AB-A-0050): a local safetensors adapter applied in `load()` after the
-    /// DiT is resident, as an activation-path term (survives bf16 AND the int8/int4 tiers).
+    /// Deprecated (AB-A-0192): name adapters per request instead (`T2IRequest` / `IEditRequest
+    /// .adapters`, contract 1.53.0). Kept for apps built around one local adapter (LTX Studio's
+    /// model-sheet pose lane): a safetensors adapter applied at load, kept under every request's
+    /// adapters and re-applied on each DiT reload, as an activation-path term (bf16 and int8/int4).
     /// A runtime override like klein's — env-specific, NOT persisted (nil on decode).
     public var loraPath: String?
     /// Multiplier on the adapter's own alpha/rank scale (1.0 = diffusers `load_lora_weights`).

@@ -136,8 +136,10 @@ public final class MageFlowEditPipeline {
     private var ditModel: MageFlowTransformer?
     let transformerDir: URL
     let ditQuant: URL?
-    /// Adapters re-applied on every DiT load (`applyLoRA`).
+    /// The adapter set, re-applied on every DiT load (`setLoRAs`, `applyLoRA`).
     private var loRAs: [(url: URL, strength: Float)] = []
+    /// Swaps `loRAs` on the resident DiT; rebuilt with each DiT load.
+    private var swapper: MageLoRASwapper?
     let vae: VAEWeights
     /// Mutable so an engine wrapper can apply per-request overrides (steps/size/seed/cfg).
     public var cfg: MageFlowEditConfig
@@ -226,7 +228,9 @@ public final class MageFlowEditPipeline {
             model.update(parameters: ModuleParameters.unflattened(w.filter { keys.contains($0.key) }))
             eval(model)
         }
-        if !loRAs.isEmpty { try MageLoRA.apply(loRAs: loRAs, to: model, dtype: ditDtype) }
+        let swapper = MageLoRASwapper(model: model, dtype: ditDtype)
+        if !loRAs.isEmpty { try swapper.set(loRAs) }
+        self.swapper = swapper
         ditModel = model
         transformerLoads += 1
         transformerLoadSeconds += Date().timeIntervalSince(start)
@@ -236,14 +240,33 @@ public final class MageFlowEditPipeline {
     /// Release the DiT (it reloads, with its LoRA, on the next denoise).
     public func dropTransformer() {
         ditModel = nil
+        swapper = nil
         MLX.Memory.clearCache()
     }
 
-    /// Apply LoRA adapter(s) to the DiT (edit AND t2i paths share it), loading it if it is
-    /// evicted. The adapters stay for the pipeline's lifetime and are re-applied on every reload.
+    /// Make `new` the DiT's adapter set (per-request adapters; edit AND t2i paths share it). A
+    /// resident DiT is restored to its base and re-adapted; an evicted one takes the set when it
+    /// reloads. The files are checked first either way, so a bad adapter throws with the previous
+    /// set still in place.
+    public func setLoRAs(_ new: [(url: URL, strength: Float)]) throws {
+        if let swapper {
+            try swapper.set(new)
+        } else if !new.isEmpty {
+            _ = try MageLoRA.combined(new, dtype: ditDtype)
+        }
+        loRAs = new
+    }
+
+    /// The adapter set on the DiT (re-applied on every reload).
+    public var activeLoRAs: [(url: URL, strength: Float)] { loRAs }
+
+    /// Add LoRA adapter(s) to the DiT's set, loading it if it is evicted. They stay until the
+    /// next `setLoRAs` and are re-applied on every reload.
     @discardableResult
     public func applyLoRA(loRAs new: [(url: URL, strength: Float)]) throws -> MageLoRA.AppliedSummary {
-        let summary = try MageLoRA.apply(loRAs: new, to: try dit(), dtype: ditDtype)
+        _ = try dit()
+        guard let swapper else { throw MageFlowEditError.load("DiT not resident") }
+        let summary = try swapper.set(loRAs + new)
         loRAs += new
         return summary
     }

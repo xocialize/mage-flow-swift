@@ -28,6 +28,48 @@ public enum MageFlowPackageError: Error, LocalizedError {
     }
 }
 
+// MARK: - typed adapters (contract 1.53.0)
+
+/// What the Mage surfaces accept in the way of adapters (AB-A-0192): per-request adapters in the
+/// diffusers / ai-toolkit dialect `MageLoRA` reads, up to 4 rank-stacked, at every quant (the delta
+/// rides `QLoRALinear` on int8/int4). t2i and edit are different DiT checkpoints, so they are
+/// different base models; reference-conditioned ("IC") adapters only on edit, whose references
+/// carry their conditioning (LTX Studio's RefControl pose adapter on Mage-Flow-Edit-Base).
+public enum MageAdapters {
+    /// Base-model keys (`AdapterDescriptor.baseModels`): the t2i checkpoints (Mage-Flow, -Base,
+    /// -Turbo) and the edit checkpoints (Mage-Flow-Edit, -Base, -Turbo). A registry's clearance
+    /// records which tier was judged.
+    public static let t2iBaseModel = "mage-flow"
+    public static let editBaseModel = "mage-flow-edit"
+    public static let formats: [AdapterFormat] = [.diffusersPEFT]
+
+    public static func support(_ capability: Capability) -> AdapterSupport {
+        let edit = capability == .imageEdit
+        return AdapterSupport(baseModel: edit ? editBaseModel : t2iBaseModel, formats: formats,
+                              kinds: edit ? [.plain, .referenceConditioned] : [.plain],
+                              maxCount: 4, strengthRange: AdapterStrengthRange(min: 0, max: 2),
+                              quants: nil, binding: .perRequest)
+    }
+
+    /// Conditioning images of the request's IC adapter, in slot order — they lead the edit's
+    /// references (RefControl: the skeleton, then the identity). At most one IC adapter per request.
+    static func conditioningImages(_ adapters: [ResolvedAdapter]) throws -> [Image] {
+        let ic = adapters.filter { $0.kind == .referenceConditioned }
+        guard ic.count <= 1 else {
+            throw PackageError.unsupportedRequestFeature(
+                "adapters — at most one reference-conditioned adapter per request (got "
+                    + ic.map(\.id).joined(separator: ", ") + ")")
+        }
+        return try (ic.first?.conditioning ?? []).map { input in
+            guard case .image(let image) = input.media else {
+                throw PackageError.unsupportedRequestFeature(
+                    "adapter \"\(ic[0].id)\" conditioning role \"\(input.role)\" — Mage takes images only")
+            }
+            return image
+        }
+    }
+}
+
 // MARK: - run-phase progress bridge
 
 /// Forwards the core's ambient phase events into the engine's `RunProgress` plane (contract
@@ -53,6 +95,10 @@ enum MageProgressBridge {
 final class MageFlowRuntime {
     let configuration: MageFlowConfiguration
     private var pipeline: MageFlowEditPipeline?
+    /// The deprecated load-time adapter (`MageFlowConfiguration.loraPath`), kept under every request's set.
+    private var residentLoRA: [(url: URL, strength: Float)] = []
+    /// The request adapter set on the DiT now (sha256 and strength per adapter, in request order).
+    private var appliedAdapters: [String] = []
 
     nonisolated init(configuration: MageFlowConfiguration) { self.configuration = configuration }
 
@@ -89,21 +135,48 @@ final class MageFlowRuntime {
             cfg: pcfg,
             deferConditioner: cfg.dropsConditioner,
             deferTransformer: cfg.evictTransformer)
-        // Runtime DiT-LoRA (AB-A-0050): applied after the DiT is resident, before any run.
-        // The adapter file is a local path (the store's loras/ dir, not a WeightSource);
-        // a missing file fails load() legibly rather than running the base silently.
+        // The deprecated load-time adapter (AB-A-0050; per-request adapters replace it, AB-A-0192):
+        // a local file kept under every request's set and re-applied on each DiT reload. A
+        // missing file fails load() legibly rather than running the base silently.
+        residentLoRA = []
+        appliedAdapters = []
         if let loraPath = cfg.loraPath {
             let url = URL(fileURLWithPath: (loraPath as NSString).expandingTildeInPath)
             guard FileManager.default.fileExists(atPath: url.path) else {
                 throw MageFlowPackageError.unreadableSnapshot("LoRA not found: \(loraPath)")
             }
-            try pipeline?.applyLoRA(loRAs: [(url, cfg.loraStrength)])
+            residentLoRA = [(url, cfg.loraStrength)]
+            try pipeline?.setLoRAs(residentLoRA)
         }
     }
 
     func unload() async {
         pipeline = nil
+        residentLoRA = []
+        appliedAdapters = []
         MLX.Memory.clearCache()
+    }
+
+    /// Make `adapters` (engine-resolved, verified) the DiT's set when it differs from the one applied,
+    /// on top of the load-time adapter. This package checks only what it alone knows: the dialect,
+    /// and that every tensor lands (`MageLoRA.LoRAError.unknownKeys`).
+    func applyAdapters(_ adapters: [ResolvedAdapter]) throws {
+        guard let pipeline else { throw PackageError.notLoaded }
+        for adapter in adapters where !MageAdapters.formats.contains(adapter.format) {
+            throw PackageError.unsupportedRequestFeature(
+                "adapter \"\(adapter.id)\" is in the \(adapter.format) dialect; Mage-Flow reads "
+                    + MageAdapters.formats.map(\.rawValue).joined(separator: ", "))
+        }
+        let wanted = adapters.map { "\($0.source.sha256)@\($0.strength)" }
+        guard wanted != appliedAdapters else { return }
+        do {
+            try pipeline.setLoRAs(residentLoRA + adapters.map { ($0.fileURL, Float($0.strength)) })
+        } catch {
+            appliedAdapters = []
+            try? pipeline.setLoRAs(residentLoRA)
+            throw error
+        }
+        appliedAdapters = wanted
     }
 
     /// Per-request canonical overrides onto the pipeline's config (restored by the caller).
@@ -133,9 +206,11 @@ final class MageFlowRuntime {
     /// DiT loads (`evictTransformer`: the DiT is out while the conditioner is in).
     func generate(
         prompt: String, negativePrompt: String?, width: Int?, steps: Int?,
-        guidance: Double?, seed: UInt64?, refImages: [Image], initSigma: Float? = nil
+        guidance: Double?, seed: UInt64?, refImages: [Image], initSigma: Float? = nil,
+        adapters: [ResolvedAdapter] = []
     ) async throws -> Image {
         guard let pipeline else { throw PackageError.notLoaded }
+        try applyAdapters(adapters)
         let cfg = configuration
         let base = pipeline.cfg
         defer { pipeline.cfg = base }
@@ -193,9 +268,11 @@ final class MageFlowRuntime {
     /// byte-identical to `generate` alone on that tile at that seed.
     func generateTiles(
         prompt: String, negativePrompt: String?, width: Int?, steps: Int?,
-        guidance: Double?, seed: UInt64?, tiles: [Image], initSigma: Float? = nil
+        guidance: Double?, seed: UInt64?, tiles: [Image], initSigma: Float? = nil,
+        adapters: [ResolvedAdapter] = []
     ) async throws -> Image {
         guard let pipeline else { throw PackageError.notLoaded }
+        try applyAdapters(adapters)
         let cfg = configuration
         let base = pipeline.cfg
         defer { pipeline.cfg = base }
@@ -295,7 +372,7 @@ public final class MageFlowT2IPackage: ModelPackage {
                         + "filter (fail-closed) and bit-exact Gaussian-Shading provenance "
                         + "watermark.",
                     modes: []
-                )
+                ).declaring(adapters: MageAdapters.support(.textToImage))
             ]
         )
     }
@@ -329,9 +406,14 @@ public final class MageFlowT2IPackage: ModelPackage {
             throw PackageError.unsupportedRequestFeature(
                 "non-square output (\(w)×\(h)) — Mage-Flow's validated envelope is square 512–2048")
         }
+        if t2i.resolvedAdapters.contains(where: { $0.kind == .referenceConditioned }) {
+            throw PackageError.unsupportedRequestFeature(
+                "adapters — a reference-conditioned adapter needs the imageEdit surface")
+        }
         let image = try await runtime.generate(
             prompt: t2i.prompt, negativePrompt: t2i.negativePrompt, width: t2i.width ?? t2i.height,
-            steps: t2i.steps, guidance: t2i.guidanceScale, seed: t2i.seed, refImages: [])
+            steps: t2i.steps, guidance: t2i.guidanceScale, seed: t2i.seed, refImages: [],
+            adapters: t2i.resolvedAdapters)
         return T2IResponse(image: image)
     }
 }
@@ -364,9 +446,10 @@ public final class MageFlowEditPackage: ModelPackage {
                         + "@512²). Mandatory fail-closed content filter + Gaussian-Shading "
                         + "watermark. Mode `tiles`: each image edited on its own with the same "
                         + "instruction (image k at seed + k, one conditioner load for all), "
-                        + "returned stacked top to bottom in input order.",
+                        + "returned stacked top to bottom in input order. A reference-conditioned "
+                        + "adapter's conditioning images lead the references, in slot order.",
                     modes: [MageFlowModes.tiles]
-                )
+                ).declaring(adapters: MageAdapters.support(.imageEdit))
             ]
         )
     }
@@ -392,17 +475,19 @@ public final class MageFlowEditPackage: ModelPackage {
         guard let edit = request as? IEditRequest else {
             throw PackageError.unsupportedCapability(request.capability)
         }
-        guard !edit.images.isEmpty else {
+        if edit.mode == MageFlowModes.tiles { return try await runTiles(edit) }
+        // An IC adapter's conditioning images lead, in slot order, then the request's own.
+        let refs = try MageAdapters.conditioningImages(edit.resolvedAdapters) + edit.images
+        guard !refs.isEmpty else {
             throw PackageError.unsupportedRequestFeature("imageEdit requires at least one reference image")
         }
-        if edit.mode == MageFlowModes.tiles { return try await runTiles(edit) }
         // 1…3 references in prompt order (Image 1 = primary) — upstream's TRAINED range
         // (AB-A-0047, multi-ref landed 2026-09-02). Beyond 3 is untested territory upstream
         // too ("trained with up to 3, but more are accepted"): reject legibly rather than
         // silently truncating the caller's reference stack.
-        guard edit.images.count <= MageFlowEditConfig.maxReferences else {
+        guard refs.count <= MageFlowEditConfig.maxReferences else {
             throw PackageError.unsupportedRequestFeature(
-                "\(edit.images.count) reference images — Mage-Flow-Edit's trained range is 1…\(MageFlowEditConfig.maxReferences)")
+                "\(refs.count) reference images — Mage-Flow-Edit's trained range is 1…\(MageFlowEditConfig.maxReferences)")
         }
         if let w = edit.width, let h = edit.height, w != h {
             throw PackageError.unsupportedRequestFeature(
@@ -412,8 +497,8 @@ public final class MageFlowEditPackage: ModelPackage {
         let image = try await runtime.generate(
             prompt: edit.prompt, negativePrompt: edit.negativePrompt,
             width: edit.width ?? edit.height, steps: edit.steps,
-            guidance: edit.guidanceScale, seed: edit.seed, refImages: edit.images,
-            initSigma: initSigma)
+            guidance: edit.guidanceScale, seed: edit.seed, refImages: refs,
+            initSigma: initSigma, adapters: edit.resolvedAdapters)
         return IEditResponse(image: image)
     }
 }
@@ -427,6 +512,14 @@ extension MageFlowEditPackage {
 
     /// `MageFlowModes.tiles`: validated before any model work.
     func runTiles(_ edit: IEditRequest) async throws -> IEditResponse {
+        guard !edit.images.isEmpty else {
+            throw PackageError.unsupportedRequestFeature("imageEdit requires at least one reference image")
+        }
+        // Each tile is Image 1 of its own edit, so there is nowhere for IC conditioning to go.
+        if edit.resolvedAdapters.contains(where: { $0.kind == .referenceConditioned }) {
+            throw PackageError.unsupportedRequestFeature(
+                "adapters — the tiles mode edits each tile alone and takes plain adapters only")
+        }
         guard edit.images.count <= MageFlowModes.maxTiles else {
             throw PackageError.unsupportedRequestFeature(
                 "\(edit.images.count) tiles — the tiles mode takes at most \(MageFlowModes.maxTiles) per request")
@@ -440,7 +533,7 @@ extension MageFlowEditPackage {
             prompt: edit.prompt, negativePrompt: edit.negativePrompt,
             width: edit.width ?? edit.height, steps: edit.steps,
             guidance: edit.guidanceScale, seed: edit.seed, tiles: edit.images,
-            initSigma: initSigma)
+            initSigma: initSigma, adapters: edit.resolvedAdapters)
         return IEditResponse(image: image)
     }
 }
