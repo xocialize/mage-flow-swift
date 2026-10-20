@@ -69,8 +69,8 @@
       "kind" : "remoteSourceControl",
       "location" : "https://github.com/xocialize/qwen3vl-mlx-swift.git",
       "state" : {
-        "revision" : "38e9028a38d2bacc9f9cf14569b5ff3f617fa791",
-        "version" : "0.4.0"
+        "revision" : "8e28a8656cb17c0edeb2cc88038dc00403051b6b",
+        "version" : "0.6.0"
       }
     },
     {
